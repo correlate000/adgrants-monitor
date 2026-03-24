@@ -1,0 +1,25 @@
+# Environment
+.env
+*.env
+
+# Google Ads credentials
+google-ads.yaml
+
+# GCP service account key
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+pause_log.json
+
+# macOS
+.DS_Store

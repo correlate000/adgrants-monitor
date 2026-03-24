@@ -1,0 +1,2114 @@
+#!/usr/bin/env python3
+"""
+Google Ads campaign performance monitoring script
+Monitoring and auto-response tool to maintain Ad Grants CTR standard (account-wide 5%+)
+
+Usage:
+  python monitor_ad_performance.py                    # Report for past 7 days (report only)
+  python monitor_ad_performance.py --days 14          # Past 14 days
+  python monitor_ad_performance.py --auto-pause       # Auto-pause low-CTR keywords
+  python monitor_ad_performance.py --auto-pause --dry-run  # Dry run (no actual pause)
+  python monitor_ad_performance.py --json-only        # JSON output only
+  python monitor_ad_performance.py --undo             # Undo all latest PAUSEs
+  python monitor_ad_performance.py --undo-date 2026-02-18  # Undo PAUSEs on specified date
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import sys
+import uuid
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import analyze_search_terms as search_terms_mod
+
+import httpx
+from dotenv import load_dotenv
+from google.ads.googleads.client import GoogleAdsClient
+from google.ads.googleads.errors import GoogleAdsException
+from google.api_core.exceptions import BadRequest
+from google.cloud import bigquery
+from google.protobuf import field_mask_pb2
+
+from config import CAMPAIGN_NAME, CAMPAIGN_NAMES, CAMPAIGN_PAUSE_TYPE, CUSTOMER_ID
+from ads_common.gaql import validate_gaql_value
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# Ad Grants CTR thresholds
+CTR_CRITICAL_THRESHOLD = 0.05   # 5% or below -> CRITICAL (risk of suspension)
+CTR_WARNING_THRESHOLD = 0.07    # 7% or below -> WARNING (approaching danger zone)
+CTR_AD_GROUP_MIN = 0.05         # Per ad group: WARNING if < 5%
+QS_MIN = 3                      # Ad Grants minimum quality score
+
+# Per-campaign PAUSE criteria (type definitions in config.CAMPAIGN_PAUSE_TYPE)
+CV_PAUSE_MIN_CLICKS = 20        # cv type: pause if click >= 20 and CV < 0.5
+CTR_KW_PAUSE_100IMP = 0.03      # ctr type: auto-pause if 100+ imp and CTR < 3%
+CTR_KW_PAUSE_50IMP = 0.02       # ctr type: auto-pause if 50+ imp and CTR < 2%
+CTR_EARLY_WARNING_THRESHOLD = 0.06  # 6% -> early warning
+
+# Safety guards
+MAX_PAUSE_PER_RUN = 3           # Max 3 keywords paused per run
+MAX_PAUSE_PER_DAY = 5           # Max cumulative pauses per day
+MIN_ENABLED_KEYWORDS = 5        # Minimum enabled keywords remaining after PAUSE
+
+# Auto-pause exclusion list (managed via JSON)
+# Do not edit directly - update pause_exclusion_list.json instead
+# Graduation criteria: QS >= QS_MIN and imp >= EXCLUSION_GRADUATION_MIN_IMP
+EXCLUSION_GRADUATION_MIN_IMP = 10  # Minimum impressions to graduate from exclusion list
+
+# Report output directory
+SCRIPT_DIR = Path(__file__).parent
+REPORTS_DIR = SCRIPT_DIR / "reports"
+YAML_PATH = SCRIPT_DIR / "google-ads.yaml"
+PAUSE_LOG_PATH = SCRIPT_DIR / "pause_log.json"
+PAUSE_EXCLUSION_FILE = SCRIPT_DIR / "pause_exclusion_list.json"
+
+# BigQuery configuration
+SA_KEY_PATH = Path(os.path.expanduser("~/.config/gcloud/local-scripts-sa-key.json"))
+BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", "")
+BQ_DATASET_ID = os.environ.get("BQ_DATASET_ID", "")
+BQ_BATCH_SIZE = 1000
+
+# Load .env (Discord notifications are skipped if not configured)
+load_dotenv(SCRIPT_DIR / ".env")
+DISCORD_WEBHOOK_AD_ALERT = os.environ.get("DISCORD_WEBHOOK_AD_ALERT", "")
+DISCORD_WEBHOOK_DAILY_REPORT = os.environ.get("DISCORD_WEBHOOK_DAILY_REPORT", "")
+
+
+# ===== GAQL Queries =====
+
+CAMPAIGN_QUERY = """
+    SELECT
+        campaign.id,
+        campaign.name,
+        campaign.status,
+        campaign_budget.amount_micros,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr,
+        metrics.average_cpc,
+        metrics.cost_micros,
+        metrics.conversions,
+        metrics.all_conversions
+    FROM campaign
+    WHERE {campaign_filter}
+      AND segments.date BETWEEN '{start_date}' AND '{end_date}'
+"""
+
+AD_GROUP_QUERY = """
+    SELECT
+        ad_group.id,
+        ad_group.name,
+        ad_group.status,
+        campaign.name,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr,
+        metrics.average_cpc,
+        metrics.cost_micros,
+        metrics.conversions
+    FROM ad_group
+    WHERE {campaign_filter}
+      AND segments.date BETWEEN '{start_date}' AND '{end_date}'
+      AND ad_group.status != 'REMOVED'
+"""
+
+KEYWORD_QUERY = """
+    SELECT
+        ad_group_criterion.criterion_id,
+        ad_group_criterion.resource_name,
+        ad_group_criterion.keyword.text,
+        ad_group_criterion.keyword.match_type,
+        ad_group_criterion.status,
+        ad_group_criterion.quality_info.quality_score,
+        ad_group.id,
+        ad_group.name,
+        campaign.name,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr,
+        metrics.average_cpc,
+        metrics.cost_micros,
+        metrics.conversions
+    FROM keyword_view
+    WHERE {campaign_filter}
+      AND ad_group_criterion.status != 'REMOVED'
+      AND segments.date BETWEEN '{start_date}' AND '{end_date}'
+"""
+
+AD_QUERY = """
+    SELECT
+        ad_group_ad.ad.id,
+        ad_group_ad.ad.responsive_search_ad.headlines,
+        ad_group_ad.status,
+        ad_group.name,
+        campaign.name,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr
+    FROM ad_group_ad
+    WHERE {campaign_filter}
+      AND ad_group_ad.status != 'REMOVED'
+      AND segments.date BETWEEN '{start_date}' AND '{end_date}'
+"""
+
+# For BQ storage: all campaign daily data (with segments.date)
+# NOTE: When using .format(), always pass through _validate_gaql_value()
+BQ_DAILY_CAMPAIGN_QUERY = """
+    SELECT
+        segments.date,
+        campaign.id,
+        campaign.name,
+        campaign.status,
+        campaign_budget.amount_micros,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr,
+        metrics.cost_micros,
+        metrics.conversions
+    FROM campaign
+    WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+      AND campaign.status != 'REMOVED'
+    ORDER BY segments.date DESC
+"""
+
+# NOTE: When using .format(), always pass through _validate_gaql_value()
+BQ_DAILY_KEYWORD_QUERY = """
+    SELECT
+        segments.date,
+        campaign.id,
+        campaign.name,
+        ad_group.id,
+        ad_group.name,
+        ad_group_criterion.criterion_id,
+        ad_group_criterion.keyword.text,
+        ad_group_criterion.keyword.match_type,
+        ad_group_criterion.status,
+        ad_group_criterion.quality_info.quality_score,
+        metrics.impressions,
+        metrics.clicks,
+        metrics.ctr,
+        metrics.average_cpc,
+        metrics.cost_micros,
+        metrics.conversions
+    FROM keyword_view
+    WHERE segments.date = '{date}'
+      AND ad_group_criterion.status != 'REMOVED'
+"""
+
+
+# ===== Utilities =====
+
+def _validate_gaql_value(value: str, field_name: str) -> str:
+    """Validate a value to be embedded in a GAQL query (delegates to ads_common.gaql)."""
+    return validate_gaql_value(value, field_name)
+
+
+def micros_to_dollars(micros: int) -> float:
+    return micros / 1_000_000
+
+
+def load_pause_log() -> list[dict]:
+    """Load pause_log.json. If file doesn't exist, attempt to restore from BQ."""
+    if PAUSE_LOG_PATH.exists():
+        try:
+            with open(PAUSE_LOG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to load pause_log.json: %s", e)
+    # BQ fallback
+    try:
+        bq_client = bigquery.Client.from_service_account_json(str(SA_KEY_PATH))
+        query = f"""
+            SELECT id, target_name AS keyword_text, target_id AS keyword_id,
+                   reason, previous_status, created_at
+            FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_actions_log`
+            WHERE action_type = 'PAUSE'
+            ORDER BY created_at DESC
+            LIMIT 100
+        """
+        rows = list(bq_client.query(query).result())
+        log = []
+        for row in rows:
+            d = dict(row)
+            for k, v in d.items():
+                if hasattr(v, 'isoformat'):
+                    d[k] = v.isoformat()
+            log.append(d)
+        if log:
+            logger.info("Restored %d PAUSE log entries from BQ", len(log))
+        return log
+    except Exception as e:
+        logger.warning("BQ fallback also failed: %s", e)
+        return []
+
+
+def save_pause_log(log: list[dict]) -> None:
+    """Save pause_log.json."""
+    try:
+        with open(PAUSE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning("Failed to save pause_log.json: %s", e)
+
+
+# ===== Auto-pause exclusion list (JSON managed) =====
+
+def load_pause_exclusion_list() -> dict[str, str]:
+    """Load pause_exclusion_list.json and return {keyword: reason} dict."""
+    if not PAUSE_EXCLUSION_FILE.exists():
+        return {}
+    try:
+        with open(PAUSE_EXCLUSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {e["keyword"]: e["reason"] for e in data.get("entries", [])}
+    except (json.JSONDecodeError, KeyError, OSError) as e:
+        logger.warning("Failed to load pause_exclusion_list.json: %s", e)
+        return {}
+
+
+def save_pause_exclusion_list(entries: list[dict]) -> None:
+    """Save pause_exclusion_list.json."""
+    try:
+        with open(PAUSE_EXCLUSION_FILE, "w", encoding="utf-8") as f:
+            json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning("Failed to save pause_exclusion_list.json: %s", e)
+
+
+def check_exclusion_graduation(
+    keywords: list[dict],
+    discord: bool = False,
+) -> list[str]:
+    """
+    Check graduation of keywords registered in PAUSE_EXCLUSION_LIST.
+
+    Graduation criteria: QS >= QS_MIN and imp >= EXCLUSION_GRADUATION_MIN_IMP
+    If criteria met, automatically remove from JSON and notify Discord.
+
+    Returns:
+        graduated: list of graduated keyword texts
+    """
+    if not PAUSE_EXCLUSION_FILE.exists():
+        return []
+
+    try:
+        with open(PAUSE_EXCLUSION_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("entries", [])
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load exclusion list: %s", e)
+        return []
+
+    graduated: list[str] = []
+    remaining: list[dict] = []
+
+    for entry in entries:
+        kw_text = entry["keyword"]
+        kw_data = next(
+            (k for k in keywords if k["keyword_text"] == kw_text and k["status"] == "ENABLED"),
+            None,
+        )
+
+        if kw_data is None:
+            remaining.append(entry)
+            continue
+
+        qs = kw_data.get("quality_score")
+        imp = kw_data.get("impressions", 0)
+
+        # Graduation: QS threshold cleared + not subject to current PAUSE criteria
+        qs_ok = qs is not None and qs >= QS_MIN and imp >= EXCLUSION_GRADUATION_MIN_IMP
+        would_be_paused = is_pause_target(kw_data)[0] if qs_ok else False
+
+        if qs_ok and not would_be_paused:
+            logger.info(
+                "[Graduated] '%s' recovered to QS=%s / imp=%s, also clears PAUSE criteria. Removing from exclusion list.",
+                kw_text, qs, imp,
+            )
+            graduated.append(kw_text)
+
+            if discord and DISCORD_WEBHOOK_AD_ALERT:
+                embed = build_ad_alert_embed(
+                    title="Keyword Exclusion List Graduation",
+                    description=f"'{kw_text}' QS has recovered above threshold ({QS_MIN}).",
+                    severity="SUCCESS",
+                    fields={
+                        "QS": str(qs),
+                        "Impressions (7d)": str(imp),
+                        "Registration reason": entry.get("reason", "-"),
+                        "Registration date": entry.get("added_at", "-"),
+                    },
+                )
+                send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+        else:
+            remaining.append(entry)
+
+    if graduated:
+        save_pause_exclusion_list(remaining)
+        # Update global dict (reflected in identify_pause_targets for this run)
+        # WARNING: Thread-unsafe - this script assumes single-process (launchd single launch).
+        # If parallelized in the future, remove PAUSE_EXCLUSION_LIST from global
+        # and pass it as an argument from main().
+        PAUSE_EXCLUSION_LIST.clear()
+        PAUSE_EXCLUSION_LIST.update({e["keyword"]: e["reason"] for e in remaining})
+
+    return graduated
+
+
+# ===== Global exclusion list (loaded from JSON at startup) =====
+PAUSE_EXCLUSION_LIST: dict[str, str] = load_pause_exclusion_list()
+
+
+def format_ctr(ctr: float) -> str:
+    """Format CTR as % display with icon based on threshold"""
+    pct = ctr * 100
+    if ctr >= CTR_WARNING_THRESHOLD:
+        icon = "OK"
+    elif ctr >= CTR_CRITICAL_THRESHOLD:
+        icon = "WARNING"
+    else:
+        icon = "CRITICAL"
+    return f"{pct:.2f}% [{icon}]"
+
+
+def format_ctr_raw(ctr: float) -> str:
+    return f"{ctr * 100:.2f}%"
+
+
+def get_campaign_pause_type(campaign_name: str) -> str | None:
+    """Return PAUSE strategy type from campaign name.
+
+    Prefix match against CAMPAIGN_PAUSE_TYPE keys.
+    Returns None if no match (not subject to auto-PAUSE).
+    """
+    for prefix, pause_type in CAMPAIGN_PAUSE_TYPE.items():
+        if campaign_name.startswith(prefix):
+            return pause_type
+    return None
+
+
+def is_pause_target(kw: dict) -> tuple[bool, str | None]:
+    """Determine if keyword is a PAUSE target based on per-campaign criteria.
+
+    Returns:
+        (is_target, reason): True + reason string if PAUSE target
+    """
+    imp = kw["impressions"]
+    clicks = kw.get("clicks", 0)
+    ctr = kw["ctr"]
+    qs = kw.get("quality_score")
+    cv = kw.get("conversions", 0)
+    campaign = kw.get("campaign_name", "")
+    pause_type = get_campaign_pause_type(campaign)
+
+    # Common: QS=1 stops immediately (cannot participate in auction)
+    if qs is not None and qs <= 1:
+        return True, f"QS {qs} (<=1) / {imp}imp — immediate stop (unrecoverable)"
+
+    if pause_type == "cv":
+        # CV-focused — stop KWs consuming clicks without CV
+        if clicks >= CV_PAUSE_MIN_CLICKS and cv < 0.5:
+            return True, f"{clicks}click / CV {cv:.1f} — clicks consumed without CV"
+
+    elif pause_type == "ctr":
+        # Access-focused — stop low CTR KWs
+        if imp >= 100 and ctr < CTR_KW_PAUSE_100IMP:
+            return True, f"{imp}imp with CTR {format_ctr_raw(ctr)} (< 3%)"
+        if imp >= 50 and ctr < CTR_KW_PAUSE_50IMP:
+            return True, f"{imp}imp with CTR {format_ctr_raw(ctr)} (< 2%)"
+
+    # pause_type is None -> no auto-pause except QS<=1
+    return False, None
+
+
+JST = timezone(timedelta(hours=9))
+
+
+def build_date_range(days: int) -> tuple[str, str]:
+    end = datetime.now(tz=JST)
+    start = end - timedelta(days=days - 1)
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def build_campaign_filter(campaign_names: list[str] | None = None) -> str:
+    """Generate GAQL campaign filter condition.
+
+    Single: campaign.name = 'X'
+    Multiple: campaign.name IN ('X', 'Y')
+    """
+    names = campaign_names or CAMPAIGN_NAMES
+    validated = [_validate_gaql_value(n, "campaign_name") for n in names]
+    if len(validated) == 1:
+        return f"campaign.name = '{validated[0]}'"
+    quoted = ", ".join(f"'{n}'" for n in validated)
+    return f"campaign.name IN ({quoted})"
+
+
+def ensure_reports_dir():
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ===== Data Fetching =====
+
+def fetch_campaign_metrics(client, start_date: str, end_date: str) -> dict | None:
+    """Fetch metrics for all monitored campaigns.
+
+    Returns:
+        Account-wide aggregated dict with campaigns key containing individual campaign list.
+    """
+    ga_service = client.get_service("GoogleAdsService")
+    query = CAMPAIGN_QUERY.format(
+        campaign_filter=build_campaign_filter(),
+        start_date=_validate_gaql_value(start_date, "date"),
+        end_date=_validate_gaql_value(end_date, "date"),
+    )
+    response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
+    rows = list(response)
+
+    if not rows:
+        return None
+
+    # Aggregate by campaign
+    by_campaign: dict[int, dict] = {}
+    for row in rows:
+        m = row.metrics
+        cid = row.campaign.id
+        if cid not in by_campaign:
+            by_campaign[cid] = {
+                "campaign_id": cid,
+                "campaign_name": row.campaign.name,
+                "campaign_status": row.campaign.status.name,
+                "daily_budget_dollars": micros_to_dollars(row.campaign_budget.amount_micros),
+                "impressions": 0,
+                "clicks": 0,
+                "cost_micros": 0,
+                "conversions": 0.0,
+            }
+        c = by_campaign[cid]
+        c["impressions"] += m.impressions
+        c["clicks"] += m.clicks
+        c["cost_micros"] += m.cost_micros
+        c["conversions"] += m.conversions
+
+    campaigns_list = []
+    for c in by_campaign.values():
+        imp, clk = c["impressions"], c["clicks"]
+        c["ctr"] = clk / imp if imp > 0 else 0.0
+        c["avg_cpc_dollars"] = micros_to_dollars(c["cost_micros"]) / clk if clk > 0 else 0.0
+        c["cost_dollars"] = micros_to_dollars(c.pop("cost_micros"))
+        campaigns_list.append(c)
+
+    # Account-wide aggregation
+    total_impressions = sum(c["impressions"] for c in campaigns_list)
+    total_clicks = sum(c["clicks"] for c in campaigns_list)
+    total_cost = sum(c["cost_dollars"] for c in campaigns_list)
+    total_conversions = sum(c["conversions"] for c in campaigns_list)
+    ctr = total_clicks / total_impressions if total_impressions > 0 else 0.0
+    avg_cpc = total_cost / total_clicks if total_clicks > 0 else 0.0
+
+    return {
+        "campaign_id": campaigns_list[0]["campaign_id"],
+        "campaign_name": "All Campaigns",
+        "campaign_status": campaigns_list[0]["campaign_status"],
+        "daily_budget_dollars": sum(c["daily_budget_dollars"] for c in campaigns_list),
+        "impressions": total_impressions,
+        "clicks": total_clicks,
+        "ctr": ctr,
+        "avg_cpc_dollars": avg_cpc,
+        "cost_dollars": total_cost,
+        "conversions": total_conversions,
+        "campaigns": campaigns_list,
+    }
+
+
+def fetch_ad_group_metrics(client, start_date: str, end_date: str) -> list[dict]:
+    """Fetch per-ad-group metrics"""
+    ga_service = client.get_service("GoogleAdsService")
+    query = AD_GROUP_QUERY.format(
+        campaign_filter=build_campaign_filter(),
+        start_date=_validate_gaql_value(start_date, "date"),
+        end_date=_validate_gaql_value(end_date, "date"),
+    )
+    response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
+
+    # Aggregate by ad group ID (in case of daily segments)
+    groups: dict[int, dict] = {}
+    for row in response:
+        ag = row.ad_group
+        m = row.metrics
+        gid = ag.id
+
+        if gid not in groups:
+            groups[gid] = {
+                "ad_group_id": gid,
+                "ad_group_name": ag.name,
+                "campaign_name": row.campaign.name,
+                "status": ag.status.name,
+                "impressions": 0,
+                "clicks": 0,
+                "cost_micros": 0,
+                "conversions": 0.0,
+            }
+
+        groups[gid]["impressions"] += m.impressions
+        groups[gid]["clicks"] += m.clicks
+        groups[gid]["cost_micros"] += m.cost_micros
+        groups[gid]["conversions"] += m.conversions
+
+    result = []
+    for g in groups.values():
+        imp = g["impressions"]
+        clk = g["clicks"]
+        g["ctr"] = clk / imp if imp > 0 else 0.0
+        g["avg_cpc_dollars"] = (
+            micros_to_dollars(g["cost_micros"]) / clk if clk > 0 else 0.0
+        )
+        g["cost_dollars"] = micros_to_dollars(g["cost_micros"])
+        del g["cost_micros"]
+        result.append(g)
+
+    result.sort(key=lambda x: x["ctr"], reverse=True)
+    return result
+
+
+def fetch_keyword_metrics(client, start_date: str, end_date: str) -> list[dict]:
+    """Fetch per-keyword metrics"""
+    ga_service = client.get_service("GoogleAdsService")
+    query = KEYWORD_QUERY.format(
+        campaign_filter=build_campaign_filter(),
+        start_date=_validate_gaql_value(start_date, "date"),
+        end_date=_validate_gaql_value(end_date, "date"),
+    )
+    response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
+
+    keywords: dict[str, dict] = {}
+    for row in response:
+        crit = row.ad_group_criterion
+        m = row.metrics
+        key = crit.resource_name
+
+        qs_value = crit.quality_info.quality_score
+        # quality_score of 0 means not yet measured (treat as None)
+        quality_score = qs_value if qs_value > 0 else None
+
+        if key not in keywords:
+            keywords[key] = {
+                "resource_name": crit.resource_name,
+                "criterion_id": crit.criterion_id,
+                "keyword_text": crit.keyword.text,
+                "match_type": crit.keyword.match_type.name,
+                "status": crit.status.name,
+                "quality_score": quality_score,
+                "ad_group_id": row.ad_group.id,
+                "ad_group_name": row.ad_group.name,
+                "campaign_name": row.campaign.name,
+                "impressions": 0,
+                "clicks": 0,
+                "cost_micros": 0,
+                "conversions": 0.0,
+            }
+
+        keywords[key]["impressions"] += m.impressions
+        keywords[key]["clicks"] += m.clicks
+        keywords[key]["cost_micros"] += m.cost_micros
+        keywords[key]["conversions"] += m.conversions
+
+    result = []
+    for kw in keywords.values():
+        imp = kw["impressions"]
+        clk = kw["clicks"]
+        kw["ctr"] = clk / imp if imp > 0 else 0.0
+        kw["avg_cpc_dollars"] = (
+            micros_to_dollars(kw["cost_micros"]) / clk if clk > 0 else 0.0
+        )
+        kw["cost_dollars"] = micros_to_dollars(kw["cost_micros"])
+        del kw["cost_micros"]
+        result.append(kw)
+
+    result.sort(key=lambda x: x["impressions"], reverse=True)
+    return result
+
+
+def fetch_ad_metrics(client, start_date: str, end_date: str) -> list[dict]:
+    """Fetch per-ad metrics"""
+    ga_service = client.get_service("GoogleAdsService")
+    query = AD_QUERY.format(
+        campaign_filter=build_campaign_filter(),
+        start_date=_validate_gaql_value(start_date, "date"),
+        end_date=_validate_gaql_value(end_date, "date"),
+    )
+    response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
+
+    ads: dict[int, dict] = {}
+    for row in response:
+        ad_id = row.ad_group_ad.ad.id
+        m = row.metrics
+
+        if ad_id not in ads:
+            # Get up to 3 headlines
+            headlines = row.ad_group_ad.ad.responsive_search_ad.headlines
+            headline_texts = [h.text for h in headlines[:3]] if headlines else []
+
+            ads[ad_id] = {
+                "ad_id": ad_id,
+                "ad_group_name": row.ad_group.name,
+                "status": row.ad_group_ad.status.name,
+                "headlines": headline_texts,
+                "impressions": 0,
+                "clicks": 0,
+            }
+
+        ads[ad_id]["impressions"] += m.impressions
+        ads[ad_id]["clicks"] += m.clicks
+
+    result = []
+    for ad in ads.values():
+        imp = ad["impressions"]
+        clk = ad["clicks"]
+        ad["ctr"] = clk / imp if imp > 0 else 0.0
+        result.append(ad)
+
+    result.sort(key=lambda x: x["impressions"], reverse=True)
+    return result
+
+
+# ===== Alert Generation =====
+
+def generate_alerts(
+    campaign: dict | None,
+    ad_groups: list[dict],
+    keywords: list[dict],
+) -> list[dict]:
+    """Generate alert list"""
+    alerts = []
+
+    if campaign is None:
+        alerts.append({
+            "level": "INFO",
+            "category": "campaign",
+            "message": "No campaign data yet (possibly a new campaign)",
+        })
+        return alerts
+
+    # Account-wide CTR check
+    account_ctr = campaign["ctr"]
+    if account_ctr < CTR_CRITICAL_THRESHOLD:
+        alerts.append({
+            "level": "CRITICAL",
+            "category": "account_ctr",
+            "message": (
+                f"Account-wide CTR {format_ctr_raw(account_ctr)} is below 5%."
+                " Ad Grants account will be suspended if this continues for 2 consecutive months."
+            ),
+        })
+    elif account_ctr < CTR_WARNING_THRESHOLD:
+        alerts.append({
+            "level": "WARNING",
+            "category": "account_ctr",
+            "message": (
+                f"Account-wide CTR {format_ctr_raw(account_ctr)} is approaching danger zone (< 7%)."
+                " Consider pausing low-CTR keywords or improving ad copy."
+            ),
+        })
+    elif account_ctr < CTR_EARLY_WARNING_THRESHOLD:
+        alerts.append({
+            "level": "WARNING",
+            "category": "account_ctr_early_warning",
+            "message": (
+                f"Account-wide CTR {format_ctr_raw(account_ctr)} is in early warning zone (< 6%)."
+                " Consider pausing low-CTR keywords or improving ad copy."
+            ),
+        })
+
+    # Ad group CTR check
+    for ag in ad_groups:
+        if ag["impressions"] < 10:
+            continue  # Skip if insufficient impressions
+        if ag["ctr"] < CTR_AD_GROUP_MIN:
+            alerts.append({
+                "level": "WARNING",
+                "category": "ad_group_ctr",
+                "message": (
+                    f"Ad group '{ag['ad_group_name']}' CTR is"
+                    f" {format_ctr_raw(ag['ctr'])} (< 5%)"
+                ),
+                "ad_group_name": ag["ad_group_name"],
+            })
+
+    # Keyword QS check (exclude already PAUSEd)
+    for kw in keywords:
+        if kw.get("status") == "PAUSED":
+            continue
+        if kw["quality_score"] is not None and kw["quality_score"] < QS_MIN:
+            alerts.append({
+                "level": "WARNING",
+                "category": "quality_score",
+                "message": (
+                    f"Keyword '{kw['keyword_text']}' quality score is"
+                    f" {kw['quality_score']} (< 3). Ad Grants requires QS >= 3."
+                    + ("" if kw['quality_score'] <= 1 else " (Auto-pause is only for QS<=1. Consider improving.)")
+                ),
+                "keyword_text": kw["keyword_text"],
+                "quality_score": kw["quality_score"],
+            })
+
+    return alerts
+
+
+# ===== Auto-Pause =====
+
+def identify_pause_targets(keywords: list[dict]) -> list[dict]:
+    """Identify keywords subject to auto-pause.
+
+    Per-campaign pause criteria delegated to is_pause_target().
+    Strategy types centrally managed in config.CAMPAIGN_PAUSE_TYPE.
+    """
+    targets = []
+    for kw in keywords:
+        if kw["status"] == "PAUSED":
+            continue
+
+        kw_text = kw.get("keyword_text", "")
+        if kw_text in PAUSE_EXCLUSION_LIST:
+            exclusion_reason = PAUSE_EXCLUSION_LIST[kw_text]
+            logger.info(f"[Excluded] '{kw_text}' is registered in auto-pause exclusion list ({exclusion_reason})")
+            continue
+
+        is_target, reason = is_pause_target(kw)
+        if is_target and reason:
+            targets.append({**kw, "pause_reason": reason})
+
+    return targets
+
+
+def pause_keywords(
+    client,
+    pause_targets: list[dict],
+    all_keywords: list[dict],
+    dry_run: bool,
+    discord: bool = False,
+) -> list[dict]:
+    """Pause target keywords. If dry_run=True, no actual pause is performed.
+
+    Safety guards:
+    - Skip if daily cumulative PAUSE count reaches MAX_PAUSE_PER_DAY
+    - Skip if PAUSE targets exceed MAX_PAUSE_PER_RUN (prompt manual review)
+    - Skip if enabled keywords would drop below MIN_ENABLED_KEYWORDS after PAUSE
+    """
+    paused_log = []
+
+    if not pause_targets:
+        return paused_log
+
+    if dry_run:
+        for kw in pause_targets:
+            paused_log.append({
+                "keyword_text": kw["keyword_text"],
+                "ad_group_name": kw["ad_group_name"],
+                "reason": kw["pause_reason"],
+                "dry_run": True,
+            })
+        return paused_log
+
+    # ===== Safety guard: count check =====
+    today_str = datetime.now(tz=JST).strftime("%Y-%m-%d")
+    existing_log = load_pause_log()
+    today_paused_count = sum(1 for e in existing_log if e.get("date") == today_str)
+
+    # Get today's PAUSE count from BQ too, use larger value (safer)
+    if SA_KEY_PATH.exists():
+        try:
+            bq_client = bigquery.Client.from_service_account_json(str(SA_KEY_PATH))
+            bq_count_query = f"""
+                SELECT COUNT(*) as cnt
+                FROM `{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_actions_log`
+                WHERE date = @today AND action_type = 'PAUSE'
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("today", "DATE", today_str),
+                ]
+            )
+            bq_today_count = list(bq_client.query(bq_count_query, job_config=job_config).result())[0].cnt
+            today_paused_count = max(today_paused_count, bq_today_count)
+        except Exception as e:
+            logger.debug("BQ PAUSE count retrieval failed (falling back to pause_log.json): %s", e)
+
+    # Daily cumulative limit check
+    if today_paused_count >= MAX_PAUSE_PER_DAY:
+        msg = (
+            f"Daily cumulative PAUSE count has reached the limit ({MAX_PAUSE_PER_DAY})."
+            f" Today: {today_paused_count}. Manual review required."
+        )
+        logger.warning(msg)
+        if discord:
+            embed = build_ad_alert_embed(
+                title="[CRITICAL] PAUSE limit reached — manual review required",
+                description=msg,
+                severity="CRITICAL",
+                fields={
+                    "Today's PAUSE count": str(today_paused_count),
+                    "Limit": str(MAX_PAUSE_PER_DAY),
+                    "Rollback": "`python monitor_ad_performance.py --undo`",
+                },
+            )
+            send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+        return paused_log
+
+    # Per-run limit check
+    if len(pause_targets) > MAX_PAUSE_PER_RUN:
+        msg = (
+            f"PAUSE targets ({len(pause_targets)}) exceed per-run limit ({MAX_PAUSE_PER_RUN})."
+            " Manual review required."
+        )
+        logger.warning(msg)
+        if discord:
+            embed = build_ad_alert_embed(
+                title="[CRITICAL] Too many PAUSE targets — manual review required",
+                description=msg,
+                severity="CRITICAL",
+                fields={
+                    "PAUSE target count": str(len(pause_targets)),
+                    "Per-run limit": str(MAX_PAUSE_PER_RUN),
+                    "Rollback": "`python monitor_ad_performance.py --undo`",
+                },
+            )
+            send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+        return paused_log
+
+    # Check enabled keyword count after PAUSE (per campaign)
+    enabled_by_campaign = Counter(
+        kw["campaign_name"] for kw in all_keywords if kw["status"] == "ENABLED"
+    )
+    targets_by_campaign = Counter(
+        t["campaign_name"] for t in pause_targets
+    )
+    blocked_campaigns = []
+    for campaign, target_count in targets_by_campaign.items():
+        remaining = enabled_by_campaign.get(campaign, 0) - target_count
+        if remaining < MIN_ENABLED_KEYWORDS:
+            blocked_campaigns.append(
+                f"{campaign}: enabled={enabled_by_campaign.get(campaign, 0)} -> remaining={remaining}"
+            )
+    if blocked_campaigns:
+        msg = (
+            f"Some campaigns would have fewer than {MIN_ENABLED_KEYWORDS} enabled KWs after PAUSE: "
+            + "; ".join(blocked_campaigns)
+            + ". Manual review required."
+        )
+        logger.warning(msg)
+        if discord:
+            embed = build_ad_alert_embed(
+                title="[CRITICAL] Insufficient enabled keywords per campaign",
+                description=msg,
+                severity="CRITICAL",
+                fields={
+                    "Affected campaigns": "\n".join(blocked_campaigns),
+                    "Minimum required/campaign": str(MIN_ENABLED_KEYWORDS),
+                    "Rollback": "`python monitor_ad_performance.py --undo`",
+                },
+            )
+            send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+        return paused_log
+
+    # ===== Execute PAUSE =====
+    criterion_service = client.get_service("AdGroupCriterionService")
+    operations = []
+
+    for kw in pause_targets:
+        operation = client.get_type("AdGroupCriterionOperation")
+        criterion = operation.update
+        criterion.resource_name = kw["resource_name"]
+        criterion.status = client.enums.AdGroupCriterionStatusEnum.PAUSED
+        operation.update_mask.CopyFrom(
+            field_mask_pb2.FieldMask(paths=["status"])
+        )
+        operations.append(operation)
+
+    try:
+        criterion_service.mutate_ad_group_criteria(
+            customer_id=CUSTOMER_ID,
+            operations=operations,
+        )
+        now_iso = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        new_entries = []
+        for kw in pause_targets:
+            entry = {
+                "date": today_str,
+                "keyword_text": kw["keyword_text"],
+                "resource_name": kw["resource_name"],
+                "previous_status": "ENABLED",
+                "paused_at": now_iso,
+                "reason": kw["pause_reason"],
+            }
+            new_entries.append(entry)
+            paused_log.append({
+                "keyword_text": kw["keyword_text"],
+                "ad_group_name": kw["ad_group_name"],
+                "reason": kw["pause_reason"],
+                "dry_run": False,
+            })
+
+            # Discord: individual PAUSE notification
+            if discord:
+                embed = build_ad_alert_embed(
+                    title=f"Keyword PAUSED",
+                    description=f"'{kw['keyword_text']}' has been paused.",
+                    severity="WARNING",
+                    fields={
+                        "Reason": kw["pause_reason"],
+                        "Ad group": kw["ad_group_name"],
+                        "Rollback": "`python monitor_ad_performance.py --undo`",
+                    },
+                )
+                send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+
+        # Append to pause_log.json
+        updated_log = existing_log + new_entries
+        save_pause_log(updated_log)
+
+    except GoogleAdsException as ex:
+        logger.error("Keyword pause API error: %s", ex)
+        for error in ex.failure.errors:
+            logger.error("  - %s", error.message)
+        if discord and DISCORD_WEBHOOK_AD_ALERT:
+            kw_names = ", ".join(t["keyword_text"] for t in pause_targets[:5])
+            embed = build_ad_alert_embed(
+                title="[CRITICAL] PAUSE API failed — keywords NOT paused",
+                description=f"mutate_ad_group_criteria failed. Target KWs: {kw_names}",
+                severity="CRITICAL",
+                fields={
+                    "Error": str(ex.failure.errors[0].message) if ex.failure.errors else str(ex),
+                    "Target count": str(len(pause_targets)),
+                    "Manual action": "Please manually pause in Google Ads console",
+                },
+            )
+            send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+
+    return paused_log
+
+
+# ===== Rollback =====
+
+def undo_pauses(client, undo_date: str | None, dry_run: bool) -> None:
+    """Undo PAUSEs recorded in pause_log.json.
+
+    Args:
+        undo_date: Undo PAUSEs on specified date (YYYY-MM-DD). If None, undo all.
+        dry_run: If True, preview only without actually reverting.
+    """
+    log = load_pause_log()
+
+    if not log:
+        print("[INFO] No entries in pause_log.json.")
+        return
+
+    if undo_date:
+        targets = [e for e in log if e.get("date") == undo_date]
+        if not targets:
+            print(f"[INFO] No PAUSE entries found for {undo_date}.")
+            return
+        remaining = [e for e in log if e.get("date") != undo_date]
+    else:
+        targets = log
+        remaining = []
+
+    print(f"[INFO] Undoing {len(targets)} PAUSEs{'(dry run)' if dry_run else ''}:")
+    for entry in targets:
+        print(
+            f"  - '{entry['keyword_text']}'"
+            f"  paused_at={entry.get('paused_at', '-')}"
+            f"  date={entry.get('date', '-')}"
+        )
+
+    if dry_run:
+        print("[DRY-RUN] No actual undo performed.")
+        return
+
+    criterion_service = client.get_service("AdGroupCriterionService")
+    operations = []
+
+    for entry in targets:
+        resource_name = entry.get("resource_name")
+        if not resource_name:
+            logger.warning(
+                "resource_name unknown for '%s'. Skipping.",
+                entry.get('keyword_text', '?'),
+            )
+            continue
+        operation = client.get_type("AdGroupCriterionOperation")
+        criterion = operation.update
+        criterion.resource_name = resource_name
+        criterion.status = client.enums.AdGroupCriterionStatusEnum.ENABLED
+        operation.update_mask.CopyFrom(
+            field_mask_pb2.FieldMask(paths=["status"])
+        )
+        operations.append(operation)
+
+    if not operations:
+        logger.warning("No undoable entries found.")
+        return
+
+    try:
+        criterion_service.mutate_ad_group_criteria(
+            customer_id=CUSTOMER_ID,
+            operations=operations,
+        )
+        print(f"[INFO] Restored {len(operations)} keywords to ENABLED.")
+        save_pause_log(remaining)
+        print(f"[INFO] pause_log.json updated (remaining: {len(remaining)}).")
+    except GoogleAdsException as ex:
+        logger.error("Rollback API error: %s", ex)
+        for error in ex.failure.errors:
+            logger.error("  - %s", error.message)
+
+
+# ===== Keyword Recommendations =====
+
+def generate_keyword_suggestions(keywords: list[dict]) -> dict:
+    """Generate keyword recommendations based on performance"""
+    # Top performers: 10+ clicks, sorted by CTR descending
+    top_performers = sorted(
+        [kw for kw in keywords if kw["clicks"] >= 10],
+        key=lambda x: x["ctr"],
+        reverse=True,
+    )[:5]
+
+    # Bottom performers: 50+ imp, sorted by CTR ascending (currently enabled)
+    bottom_performers = sorted(
+        [kw for kw in keywords if kw["impressions"] >= 50 and kw["status"] == "ENABLED"],
+        key=lambda x: x["ctr"],
+    )[:5]
+
+    # Pause candidates: match per-campaign is_pause_target criteria and still enabled
+    pause_candidates = [
+        kw for kw in keywords
+        if kw["status"] == "ENABLED"
+        and kw.get("keyword_text", "") not in PAUSE_EXCLUSION_LIST
+        and is_pause_target(kw)[0]
+    ]
+
+    # Derive theme suggestions from top keywords (using ad_group_name)
+    top_themes = list({kw["ad_group_name"] for kw in top_performers})
+    new_theme_suggestions = []
+    for theme in top_themes:
+        new_theme_suggestions.append(
+            f"Consider adding long-tail / related terms for '{theme}'"
+        )
+
+    return {
+        "top_performers": top_performers,
+        "bottom_performers": bottom_performers,
+        "pause_candidates": pause_candidates,
+        "new_keyword_themes": new_theme_suggestions,
+    }
+
+
+# ===== BigQuery Storage =====
+
+def save_to_bigquery(
+    client,
+    start_date: str,
+    end_date: str,
+    alerts: list[dict],
+    paused_log: list[dict],
+) -> bool:
+    """Save performance data to BigQuery.
+
+    Saves daily-granularity data for all campaigns.
+    Re-fetches from Google Ads API with segments.date for per-day per-campaign storage.
+    Ensures idempotency via DELETE before INSERT.
+
+    BQ storage strategy:
+    - ad_campaign_daily: daily x per-campaign data (partitioned by segments.date)
+    - ad_keyword_performance: keyword snapshot at end_date (all campaigns)
+    - ad_actions_log: action log for PAUSE etc. (generated from paused_log)
+
+    Returns:
+        bool: True if all tables saved successfully, False if any failed.
+    """
+    if not SA_KEY_PATH.exists():
+        logger.warning("SA key file not found: %s. Skipping BQ save.", SA_KEY_PATH)
+        return False
+
+    try:
+        bq_client = bigquery.Client.from_service_account_json(str(SA_KEY_PATH))
+    except Exception as e:
+        logger.warning("Failed to initialize BigQuery client: %s", e)
+        return False
+
+    account_id = CUSTOMER_ID
+    now_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bq_save_ok = True
+    ga_service = client.get_service("GoogleAdsService")
+
+    # ---------- ad_campaign_daily (all campaigns x daily) ----------
+    try:
+        table_camp = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_campaign_daily`"
+
+        # Idempotent DELETE (by period x account)
+        delete_camp_sql = f"""
+            DELETE FROM {table_camp}
+            WHERE date BETWEEN @start_date AND @end_date
+              AND account_id = @account_id
+        """
+        job_config_camp = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+                bigquery.ScalarQueryParameter("account_id", "STRING", account_id),
+            ]
+        )
+        camp_delete_ok = True
+        try:
+            bq_client.query(delete_camp_sql, job_config=job_config_camp).result()
+        except BadRequest as e:
+            if "streaming buffer" in str(e):
+                logger.info("ad_campaign_daily: Skipping DELETE+INSERT due to streaming buffer")
+                camp_delete_ok = False
+            else:
+                raise
+
+        if camp_delete_ok:
+            # Fetch daily x all campaigns data from Google Ads API
+            # NOTE: Always pass through _validate_gaql_value() when using .format()
+            daily_query = BQ_DAILY_CAMPAIGN_QUERY.format(
+                start_date=_validate_gaql_value(start_date, "date"),
+                end_date=_validate_gaql_value(end_date, "date"),
+            )
+            response = ga_service.search(customer_id=CUSTOMER_ID, query=daily_query)
+
+            alert_count = len([a for a in alerts if a.get("level") in ("CRITICAL", "WARNING")])
+
+            rows_camp = []
+            for row in response:
+                rows_camp.append({
+                    "date": row.segments.date,
+                    "account_id": account_id,
+                    "campaign_id": str(row.campaign.id),
+                    "campaign_name": row.campaign.name,
+                    "impressions": row.metrics.impressions,
+                    "clicks": row.metrics.clicks,
+                    "ctr": row.metrics.ctr,
+                    "cost": row.metrics.cost_micros / 1_000_000,
+                    "conversions": row.metrics.conversions,
+                    "daily_budget": row.campaign_budget.amount_micros / 1_000_000,
+                    "campaign_status": row.campaign.status.name,
+                    "active_keywords": None,
+                    "paused_keywords": None,
+                    "alert_count": alert_count,
+                    "synced_at": now_ts,
+                })
+
+            if rows_camp:
+                bq_table_camp = bq_client.get_table(
+                    f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_campaign_daily"
+                )
+                for i in range(0, len(rows_camp), BQ_BATCH_SIZE):
+                    batch = rows_camp[i:i + BQ_BATCH_SIZE]
+                    errors = bq_client.insert_rows_json(bq_table_camp, batch)
+                    if errors:
+                        logger.warning(
+                            "ad_campaign_daily INSERT error (batch %d): %s",
+                            i // BQ_BATCH_SIZE + 1,
+                            errors,
+                        )
+                        bq_save_ok = False
+                print(f"[BQ] ad_campaign_daily: saved {len(rows_camp)} rows")
+            else:
+                print("[BQ] ad_campaign_daily: no data (skipped)")
+
+    except GoogleAdsException as ex:
+        logger.warning("ad_campaign_daily Google Ads API error: %s", ex)
+        bq_save_ok = False
+    except Exception as e:
+        logger.warning("Failed to save ad_campaign_daily: %s", e)
+        bq_save_ok = False
+
+    # ---------- ad_keyword_performance (all campaigns, previous day snapshot) ----------
+    # Google Ads API has incomplete data for current day, use previous day (end_date - 1)
+    kw_snapshot_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    # If --days 1, ensure snapshot_date doesn't go before start_date
+    if kw_snapshot_date < start_date:
+        kw_snapshot_date = start_date
+    try:
+        table_kw = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_keyword_performance`"
+
+        # Idempotent DELETE (snapshot_date only)
+        delete_kw_sql = f"""
+            DELETE FROM {table_kw}
+            WHERE date = @date
+              AND account_id = @account_id
+        """
+        job_config_kw = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("date", "DATE", kw_snapshot_date),
+                bigquery.ScalarQueryParameter("account_id", "STRING", account_id),
+            ]
+        )
+        kw_delete_ok = True
+        try:
+            bq_client.query(delete_kw_sql, job_config=job_config_kw).result()
+        except BadRequest as e:
+            if "streaming buffer" in str(e):
+                logger.info("ad_keyword_performance: Skipping DELETE+INSERT due to streaming buffer")
+                kw_delete_ok = False
+            else:
+                raise
+
+        if not kw_delete_ok:
+            print("[BQ] ad_keyword_performance: streaming buffer active (next run will refresh)")
+        else:
+            # NOTE: Always pass through _validate_gaql_value() when using .format()
+            kw_query = BQ_DAILY_KEYWORD_QUERY.format(
+                date=_validate_gaql_value(kw_snapshot_date, "date"),
+            )
+            response = ga_service.search(customer_id=CUSTOMER_ID, query=kw_query)
+
+            rows_kw = []
+            for row in response:
+                qs = row.ad_group_criterion.quality_info.quality_score
+                rows_kw.append({
+                    "date": kw_snapshot_date,
+                    "account_id": account_id,
+                    "campaign_id": str(row.campaign.id),
+                    "campaign_name": row.campaign.name,
+                    "ad_group_id": str(row.ad_group.id),
+                    "ad_group_name": row.ad_group.name,
+                    "keyword_id": str(row.ad_group_criterion.criterion_id),
+                    "keyword_text": row.ad_group_criterion.keyword.text,
+                    "match_type": row.ad_group_criterion.keyword.match_type.name,
+                    "impressions": row.metrics.impressions,
+                    "clicks": row.metrics.clicks,
+                    "ctr": row.metrics.ctr,
+                    "cost_micros": row.metrics.cost_micros,
+                    "cost": row.metrics.cost_micros / 1_000_000,
+                    "conversions": row.metrics.conversions,
+                    "quality_score": qs if qs and qs > 0 else None,
+                    "avg_cpc_micros": int(row.metrics.average_cpc),
+                    "keyword_status": row.ad_group_criterion.status.name,
+                    "synced_at": now_ts,
+                })
+
+            if rows_kw:
+                bq_table_kw = bq_client.get_table(
+                    f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_keyword_performance"
+                )
+                for i in range(0, len(rows_kw), BQ_BATCH_SIZE):
+                    batch = rows_kw[i:i + BQ_BATCH_SIZE]
+                    errors = bq_client.insert_rows_json(bq_table_kw, batch)
+                    if errors:
+                        logger.warning(
+                            "ad_keyword_performance INSERT error (batch %d): %s",
+                            i // BQ_BATCH_SIZE + 1,
+                            errors,
+                        )
+                        bq_save_ok = False
+                print(f"[BQ] ad_keyword_performance: saved {len(rows_kw)} rows")
+            else:
+                print("[BQ] ad_keyword_performance: no data (skipped)")
+
+    except GoogleAdsException as ex:
+        logger.warning("ad_keyword_performance Google Ads API error: %s", ex)
+        bq_save_ok = False
+    except Exception as e:
+        logger.warning("Failed to save ad_keyword_performance: %s", e)
+        bq_save_ok = False
+
+    # ---------- ad_actions_log ----------
+    # INSERT only if dry_run=False and actual PAUSEs occurred
+    actual_pauses = [p for p in paused_log if not p.get("dry_run", True)]
+    if actual_pauses:
+        try:
+            rows_action = []
+            today_str = datetime.now(tz=JST).strftime("%Y-%m-%d")
+            for p in actual_pauses:
+                rows_action.append({
+                    "id": str(uuid.uuid4()),
+                    "date": today_str,
+                    "account_id": account_id,
+                    "action_type": "PAUSE",
+                    "target_type": "KEYWORD",
+                    "target_id": str(p.get("criterion_id", "")),
+                    "target_name": p.get("keyword_text", ""),
+                    "reason": p.get("reason", ""),
+                    "dry_run": False,
+                    "previous_status": "ENABLED",
+                    "created_at": now_ts,
+                })
+
+            bq_table_action = bq_client.get_table(
+                f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_actions_log"
+            )
+            errors = bq_client.insert_rows_json(bq_table_action, rows_action)
+            if errors:
+                logger.warning("ad_actions_log INSERT error: %s", errors)
+                bq_save_ok = False
+            else:
+                print(f"[BQ] ad_actions_log: saved {len(rows_action)} rows")
+
+        except Exception as e:
+            logger.warning("Failed to save ad_actions_log: %s", e)
+            bq_save_ok = False
+
+    return bq_save_ok
+
+
+# ===== Discord Notifications =====
+
+def send_discord_notification(webhook_url: str, content: str, embeds: list[dict]) -> None:
+    """Send message to Discord Webhook. On error, log to stderr and skip."""
+    if not webhook_url:
+        return
+    payload = {"content": content, "embeds": embeds}
+    try:
+        response = httpx.post(webhook_url, json=payload, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        logger.warning("Failed to send Discord notification: %s", e)
+
+
+def build_ad_alert_embed(
+    title: str,
+    description: str,
+    severity: str,
+    fields: dict[str, str],
+) -> dict:
+    """Build Discord Embed for ad alerts"""
+    color_map = {
+        "CRITICAL": 15158332,   # 0xE74C3C
+        "WARNING": 15105826,    # 0xE67E22
+        "INFO": 3447003,        # 0x3498DB
+        "SUCCESS": 3066993,     # 0x2ECC71
+    }
+    color = color_map.get(severity, color_map["INFO"])
+
+    # Generate current time in JST then convert to UTC for ISO8601
+    now_jst = datetime.now(tz=JST)
+    now_utc = now_jst.astimezone(timezone.utc)
+    timestamp = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {
+        "title": title,
+        "description": description,
+        "color": color,
+        "fields": [{"name": k, "value": v, "inline": True} for k, v in fields.items()],
+        "footer": {"text": "Google Ads Monitor | Ad Grants"},
+        "timestamp": timestamp,
+    }
+
+
+# ===== Report Output =====
+
+def print_report(
+    start_date: str,
+    end_date: str,
+    campaign: dict | None,
+    ad_groups: list[dict],
+    keywords: list[dict],
+    ads: list[dict],
+    alerts: list[dict],
+    paused_log: list[dict],
+    suggestions: dict,
+):
+    """Output formatted report to stdout"""
+    W = 64
+
+    def sep(char="="):
+        print(char * W)
+
+    def section(title):
+        print(f"\n{title}")
+        sep("-")
+
+    sep()
+    print("Google Ads Performance Report")
+    print(f"Period: {start_date} to {end_date}")
+    campaign_names_str = ", ".join(CAMPAIGN_NAMES)
+    print(f"Campaigns: {campaign_names_str}")
+    print(f"Customer ID: {CUSTOMER_ID}")
+    sep()
+
+    # --- Account-wide ---
+    section("Account-wide (all campaigns combined)")
+    if campaign is None:
+        print("  No data (new campaign, or no impressions yet)")
+    else:
+        print(f"  Impressions: {campaign['impressions']:,}")
+        print(f"  Clicks      : {campaign['clicks']:,}")
+        print(f"  CTR         : {format_ctr(campaign['ctr'])}")
+        print(f"  Avg CPC     : ${campaign['avg_cpc_dollars']:.2f}")
+        print(f"  Cost        : ${campaign['cost_dollars']:.2f}")
+        print(f"  Conversions : {campaign['conversions']:.1f}")
+        print(f"  Daily budget: ${campaign['daily_budget_dollars']:.0f}")
+
+        # Per-campaign breakdown
+        if campaign.get("campaigns"):
+            print()
+            print("  Per-campaign breakdown:")
+            for c in campaign["campaigns"]:
+                ctr_flag = "[WARNING]" if c["ctr"] < CTR_CRITICAL_THRESHOLD else ""
+                print(
+                    f"    [{c['campaign_name']}] "
+                    f"{c['impressions']:,}imp / {c['clicks']:,}click / "
+                    f"CTR {c['ctr']*100:.2f}% {ctr_flag}"
+                )
+
+    # --- Per ad group ---
+    section("Per Ad Group")
+    if not ad_groups:
+        print("  No data")
+    else:
+        col_w = [20, 6, 6, 8, 10]
+        header = (
+            f"  {'Ad Group':<{col_w[0]}}"
+            f"{'Imp':>{col_w[1]}}"
+            f"{'Click':>{col_w[2]}}"
+            f"{'CTR':>{col_w[3]}}"
+            f"{'Cost':>{col_w[4]}}"
+        )
+        print(header)
+        print("  " + "-" * (sum(col_w) + 4))
+        for ag in ad_groups:
+            name = ag["ad_group_name"][:col_w[0]]
+            ctr_flag = "[WARNING]" if ag["ctr"] < CTR_AD_GROUP_MIN and ag["impressions"] >= 10 else "  "
+            print(
+                f"  {name:<{col_w[0]}}"
+                f"{ag['impressions']:>{col_w[1]},}"
+                f"{ag['clicks']:>{col_w[2]},}"
+                f"{ag['ctr']*100:>{col_w[3]-1}.1f}%"
+                f"  ${ag['cost_dollars']:>7.2f} {ctr_flag}"
+            )
+
+    # --- Per keyword ---
+    section("Per Keyword (top 20)")
+    if not keywords:
+        print("  No data")
+    else:
+        display_kws = keywords[:20]
+        print(
+            f"  {'Keyword':<28}"
+            f"{'Match':<8}"
+            f"{'Imp':>5}"
+            f"{'Clk':>5}"
+            f"{'CTR':>7}"
+            f"{'QS':>3}"
+            f"  Status"
+        )
+        print("  " + "-" * 70)
+        for kw in display_kws:
+            kw_text = kw["keyword_text"][:27]
+            match = kw["match_type"][:6]
+            qs = str(kw["quality_score"]) if kw["quality_score"] is not None else " -"
+            status_flag = ""
+            if kw["status"] == "PAUSED":
+                status_flag = "[PAUSED]"
+            elif is_pause_target(kw)[0]:
+                status_flag = "[PAUSE_CANDIDATE]"
+            print(
+                f"  {kw_text:<28}"
+                f"{match:<8}"
+                f"{kw['impressions']:>5,}"
+                f"{kw['clicks']:>5,}"
+                f"{kw['ctr']*100:>6.1f}%"
+                f"{qs:>3}"
+                f"  {status_flag}"
+            )
+
+    # --- Per ad ---
+    section("Per Ad")
+    if not ads:
+        print("  No data")
+    else:
+        for ad in ads:
+            headline_str = " | ".join(ad["headlines"][:2]) if ad["headlines"] else "(no headlines)"
+            print(
+                f"  [{ad['ad_group_name']}] "
+                f"'{headline_str[:40]}'"
+                f"  {ad['impressions']:,}imp / {format_ctr_raw(ad['ctr'])}"
+            )
+
+    # --- Alerts ---
+    section("Alerts")
+    if not alerts:
+        print("  No alerts [OK]")
+    else:
+        level_icons = {"CRITICAL": "[CRITICAL]", "WARNING": "[WARNING]", "INFO": "[INFO]"}
+        for alert in alerts:
+            icon = level_icons.get(alert["level"], "  ")
+            print(f"  [{alert['level']}] {icon} {alert['message']}")
+
+    # --- Auto actions ---
+    section("Auto Actions (keyword pauses)")
+    if not paused_log:
+        print("  No pauses [OK]")
+    else:
+        for p in paused_log:
+            dry_label = "[DRY-RUN] " if p.get("dry_run") else ""
+            print(f"  [PAUSED] {dry_label}'{p['keyword_text']}' ({p['ad_group_name']}) -- {p['reason']}")
+
+    # --- Recommended actions ---
+    section("Recommended Actions")
+
+    print("\n  [Top 5 Keywords (10+ clicks, sorted by CTR)]")
+    if suggestions["top_performers"]:
+        for kw in suggestions["top_performers"]:
+            print(
+                f"    [OK] '{kw['keyword_text']}'"
+                f"  CTR {format_ctr_raw(kw['ctr'])}"
+                f"  {kw['clicks']} clicks"
+            )
+    else:
+        print("    Insufficient data (no keywords with 10+ clicks)")
+
+    print("\n  [Bottom 5 Keywords (50+ imp, sorted by CTR)]")
+    if suggestions["bottom_performers"]:
+        for kw in suggestions["bottom_performers"]:
+            print(
+                f"    [LOW] '{kw['keyword_text']}'"
+                f"  CTR {format_ctr_raw(kw['ctr'])}"
+                f"  {kw['impressions']}imp"
+            )
+    else:
+        print("    None")
+
+    print("\n  [Pause candidates (per-campaign criteria)]")
+    if suggestions["pause_candidates"]:
+        for kw in suggestions["pause_candidates"]:
+            print(
+                f"    [CANDIDATE] '{kw['keyword_text']}'"
+                f"  CTR {format_ctr_raw(kw['ctr'])}"
+                f"  {kw['impressions']}imp"
+                f"  -> can auto-pause with --auto-pause"
+            )
+    else:
+        print("    No pause candidates [OK]")
+
+    print("\n  [New theme candidates]")
+    if suggestions["new_keyword_themes"]:
+        for theme in suggestions["new_keyword_themes"]:
+            print(f"    [IDEA] {theme}")
+    else:
+        print("    Insufficient data for top keywords")
+
+    sep()
+    print(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    sep()
+
+
+def build_json_report(
+    start_date: str,
+    end_date: str,
+    campaign: dict | None,
+    ad_groups: list[dict],
+    keywords: list[dict],
+    ads: list[dict],
+    alerts: list[dict],
+    paused_log: list[dict],
+    suggestions: dict,
+) -> dict:
+    """Build and return JSON report"""
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "period": {"start": start_date, "end": end_date},
+        "customer_id": CUSTOMER_ID,
+        "campaign_names": CAMPAIGN_NAMES,
+        "campaign": campaign,
+        "ad_groups": ad_groups,
+        "keywords": keywords,
+        "ads": ads,
+        "alerts": alerts,
+        "actions_taken": paused_log,
+        "suggestions": {
+            "top_performers": suggestions["top_performers"],
+            "bottom_performers": suggestions["bottom_performers"],
+            "pause_candidates": suggestions["pause_candidates"],
+            "new_keyword_themes": suggestions["new_keyword_themes"],
+        },
+        "thresholds": {
+            "account_ctr_critical": CTR_CRITICAL_THRESHOLD,
+            "account_ctr_warning": CTR_WARNING_THRESHOLD,
+            "ad_group_ctr_min": CTR_AD_GROUP_MIN,
+            "kw_pause_at_100imp": CTR_KW_PAUSE_100IMP,
+            "kw_pause_at_50imp": CTR_KW_PAUSE_50IMP,
+            "quality_score_min": QS_MIN,
+        },
+    }
+
+
+def save_reports(date_str: str, report_data: dict, human_text: str):
+    """Save JSON report and text report to files"""
+    ensure_reports_dir()
+
+    json_path = REPORTS_DIR / f"ads-performance-{date_str}.json"
+    txt_path = REPORTS_DIR / f"ads-performance-{date_str}.txt"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(report_data, f, ensure_ascii=False, indent=2, default=str)
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(human_text)
+
+    print(f"\n[Saved] JSON: {json_path}")
+    print(f"[Saved] TXT : {txt_path}")
+
+
+def build_weekly_summary_embed(
+    campaign: dict | None,
+    keywords: list[dict],
+    alerts: list[dict],
+    paused_log: list[dict],
+    suggestions: dict,
+    start_date: str,
+    end_date: str,
+) -> dict:
+    """Build weekly summary Discord embed."""
+    if campaign is None:
+        return build_ad_alert_embed(
+            title="Weekly Ad Performance Summary",
+            description=f"Period: {start_date} to {end_date}\nNo data",
+            severity="INFO",
+            fields={},
+        )
+
+    ctr_pct = f"{campaign['ctr'] * 100:.2f}%"
+    ctr_status = "OK" if campaign['ctr'] >= CTR_WARNING_THRESHOLD else "WARNING" if campaign['ctr'] >= CTR_CRITICAL_THRESHOLD else "CRITICAL"
+
+    top_kws = suggestions.get("top_performers", [])
+    top_kw_text = "\n".join(
+        f"• {kw['keyword_text']} ({kw['ctr']*100:.1f}%)"
+        for kw in top_kws[:3]
+    ) or "Insufficient data"
+
+    bottom_kws = suggestions.get("bottom_performers", [])
+    bottom_kw_text = "\n".join(
+        f"• {kw['keyword_text']} ({kw['ctr']*100:.1f}%)"
+        for kw in bottom_kws[:3]
+    ) or "None"
+
+    critical_count = sum(1 for a in alerts if a["level"] == "CRITICAL")
+    warning_count = sum(1 for a in alerts if a["level"] == "WARNING")
+    pause_count = len(paused_log)
+
+    severity = "SUCCESS"
+    if critical_count > 0:
+        severity = "CRITICAL"
+    elif warning_count > 0:
+        severity = "WARNING"
+
+    return build_ad_alert_embed(
+        title="Weekly Ad Performance Summary",
+        description=f"Campaigns: {', '.join(CAMPAIGN_NAMES)}\nPeriod: {start_date} to {end_date}",
+        severity=severity,
+        fields={
+            f"CTR [{ctr_status}]": ctr_pct,
+            "Clicks": f"{campaign['clicks']:,}",
+            "Impressions": f"{campaign['impressions']:,}",
+            "Cost": f"${campaign['cost_dollars']:.2f}",
+            "CV": f"{campaign['conversions']:.1f}",
+            "PAUSE count": str(pause_count),
+            "TOP KW": top_kw_text,
+            "Low CTR KW": bottom_kw_text,
+            "Alerts": f"CRITICAL:{critical_count} / WARN:{warning_count}",
+        },
+    )
+
+
+def check_tier_promotion(
+    ad_groups: list[dict],
+    keywords: list[dict],
+    discord: bool = False,
+) -> dict | None:
+    """Check Tier promotion conditions and return suggestion if conditions met.
+
+    Promotion criteria:
+    - All ad groups in Tier N maintain CTR >= 5% for 14 days
+    - All keywords in Tier N (with measured QS) have QS >= 3
+
+    Note: Currently checks CTR/QS at snapshot time as BQ historical data reference
+    is needed for 14-day check (planned for Phase 2 expansion).
+    """
+    TIER_MIN_CTR = 0.05
+    TIER_MIN_QS = 3
+
+    # Identify ad groups in article campaign
+    # Target ad groups whose name starts with "AG-"
+    tier_groups = [ag for ag in ad_groups if ag.get("ad_group_name", "").startswith("AG-")]
+    if not tier_groups:
+        return None
+
+    # Tier 1: AG-01 ~ AG-05
+    tier1_groups = [ag for ag in tier_groups if ag["ad_group_name"][:5] in ("AG-01", "AG-02", "AG-03", "AG-04", "AG-05")]
+    if not tier1_groups:
+        return None
+
+    # Tier 2 already exists?
+    tier2_groups = [ag for ag in tier_groups if ag["ad_group_name"][:5] in ("AG-06", "AG-07", "AG-08", "AG-09", "AG-10")]
+    if tier2_groups:
+        return None  # Tier 2 already deployed
+
+    # Check all Tier 1 groups meet criteria
+    all_meet = True
+    details = []
+    for ag in tier1_groups:
+        ctr_ok = ag["ctr"] >= TIER_MIN_CTR or ag["impressions"] < 10  # Skip if insufficient imp
+        detail = f"{ag['ad_group_name']}: CTR={ag['ctr']*100:.1f}% imp={ag['impressions']}"
+        if not ctr_ok:
+            all_meet = False
+            detail += " [FAIL]"
+        else:
+            detail += " [OK]"
+        details.append(detail)
+
+    # Check QS for Tier 1 keywords
+    tier1_kw_names = {ag["ad_group_name"] for ag in tier1_groups}
+    tier1_kws = [kw for kw in keywords if kw.get("ad_group_name") in tier1_kw_names]
+    qs_issues = []
+    for kw in tier1_kws:
+        if kw["quality_score"] is not None and kw["quality_score"] < TIER_MIN_QS:
+            all_meet = False
+            qs_issues.append(f"{kw['keyword_text']}: QS={kw['quality_score']}")
+
+    result = {
+        "ready": all_meet,
+        "tier1_details": details,
+        "qs_issues": qs_issues,
+    }
+
+    if all_meet and discord and DISCORD_WEBHOOK_AD_ALERT:
+        embed = build_ad_alert_embed(
+            title="Tier 2 Promotion Ready",
+            description=(
+                "All Tier 1 (AG-01 to AG-05) ad groups have met CTR and QS criteria.\n"
+                "Consider deploying Tier 2 (AG-06 to AG-10)."
+            ),
+            severity="SUCCESS",
+            fields={
+                "Tier 1 status": "\n".join(details),
+                "QS issues": "None" if not qs_issues else "\n".join(qs_issues),
+            },
+        )
+        send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
+
+    return result
+
+
+# ===== Entry Point =====
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Google Ads campaign performance monitoring & low-CTR keyword auto-pause tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        metavar="N",
+        help="Number of days to aggregate (default: 7)",
+    )
+    parser.add_argument(
+        "--auto-pause",
+        action="store_true",
+        default=True,
+        help="Auto-pause low-CTR/low-QS keywords (default: ON)",
+    )
+    parser.add_argument(
+        "--no-auto-pause",
+        dest="auto_pause",
+        action="store_false",
+        help="Disable auto-pause and output report only",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Combined with --auto-pause: preview only without actual pause",
+    )
+    parser.add_argument(
+        "--json-only",
+        action="store_true",
+        help="Output JSON only to stdout without human-readable report",
+    )
+    parser.add_argument(
+        "--discord",
+        action="store_true",
+        help="Send alerts and daily summary to Discord Webhook (default: off)",
+    )
+    parser.add_argument(
+        "--undo",
+        action="store_true",
+        help="Undo all PAUSEs recorded in pause_log.json (restore to ENABLED)",
+    )
+    parser.add_argument(
+        "--undo-date",
+        metavar="YYYY-MM-DD",
+        help="Undo PAUSEs on specified date (e.g., --undo-date 2026-02-18)",
+    )
+    parser.add_argument(
+        "--save-bq",
+        action="store_true",
+        help="Save performance data to BigQuery",
+    )
+    parser.add_argument(
+        "--analyze-search-terms",
+        action="store_true",
+        help=(
+            "Analyze search query report and suggest negative keyword candidates."
+            " Auto-runs every Monday (also saves to BQ when combined with --save-bq)"
+        ),
+    )
+    parser.add_argument(
+        "--weekly-summary",
+        action="store_true",
+        help="Send weekly summary to Discord (auto-runs every Monday)",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Set date range
+    start_date, end_date = build_date_range(args.days)
+    date_str = datetime.today().strftime("%Y-%m-%d")
+
+    if not args.json_only:
+        print(f"[INFO] Period: {start_date} to {end_date} ({args.days} days)")
+        print(f"[INFO] google-ads.yaml: {YAML_PATH}")
+
+    # Initialize Google Ads client
+    try:
+        client = GoogleAdsClient.load_from_storage(str(YAML_PATH))
+    except Exception as e:
+        logger.error("Failed to initialize Google Ads client: %s", e)
+        logger.error("  google-ads.yaml path: %s", YAML_PATH)
+        sys.exit(1)
+
+    # --undo / --undo-date: PAUSE rollback
+    if args.undo or args.undo_date:
+        undo_pauses(client, args.undo_date, dry_run=args.dry_run)
+        return
+
+    # Fetch data
+    if not args.json_only:
+        print("[INFO] Fetching data...")
+
+    try:
+        campaign = fetch_campaign_metrics(client, start_date, end_date)
+        ad_groups = fetch_ad_group_metrics(client, start_date, end_date)
+        keywords = fetch_keyword_metrics(client, start_date, end_date)
+        ads = fetch_ad_metrics(client, start_date, end_date)
+    except GoogleAdsException as ex:
+        logger.error("Google Ads API error: %s", ex)
+        for error in ex.failure.errors:
+            logger.error("  - %s", error.message)
+        sys.exit(1)
+    except Exception as e:
+        logger.error("Data fetch error: %s", e)
+        sys.exit(1)
+
+    # Check exclusion list graduation (run after keywords fetched)
+    graduated = check_exclusion_graduation(keywords, discord=args.discord)
+    if graduated and not args.json_only:
+        print(f"[INFO] Exclusion list graduated: {', '.join(graduated)}")
+
+    # Generate alerts
+    alerts = generate_alerts(campaign, ad_groups, keywords)
+
+    # Auto-pause processing
+    paused_log: list[dict] = []
+    if args.auto_pause:
+        pause_targets = identify_pause_targets(keywords)
+        if not args.json_only and pause_targets:
+            action_label = "[DRY-RUN] " if args.dry_run else ""
+            print(
+                f"[INFO] {action_label}{len(pause_targets)} keywords are pause targets"
+            )
+        paused_log = pause_keywords(
+            client,
+            pause_targets,
+            all_keywords=keywords,
+            dry_run=args.dry_run,
+            discord=args.discord,
+        )
+
+    # Generate recommendations
+    suggestions = generate_keyword_suggestions(keywords)
+
+    # Build JSON report
+    report_data = build_json_report(
+        start_date, end_date,
+        campaign, ad_groups, keywords, ads,
+        alerts, paused_log, suggestions,
+    )
+
+    if args.json_only:
+        print(json.dumps(report_data, ensure_ascii=False, indent=2, default=str))
+        return
+
+    # Capture text report to stdout then save to file
+    import io
+    buffer = io.StringIO()
+    original_stdout = sys.stdout
+    sys.stdout = buffer
+
+    print_report(
+        start_date, end_date,
+        campaign, ad_groups, keywords, ads,
+        alerts, paused_log, suggestions,
+    )
+
+    sys.stdout = original_stdout
+    human_text = buffer.getvalue()
+    print(human_text, end="")
+
+    # Save to file
+    save_reports(date_str, report_data, human_text)
+
+    # BigQuery save
+    bq_save_ok = True
+    if args.save_bq:
+        if not args.json_only:
+            print("[INFO] Saving data to BigQuery...")
+        bq_save_ok = save_to_bigquery(
+            client,
+            start_date, end_date,
+            alerts, paused_log,
+        )
+
+    # Discord notification
+    if args.discord:
+        # Send to ad alert channel if CRITICAL/WARNING alerts exist
+        critical_warnings = [a for a in alerts if a["level"] in ("CRITICAL", "WARNING")]
+        if critical_warnings and DISCORD_WEBHOOK_AD_ALERT:
+            alert_embeds = []
+            for alert in critical_warnings:
+                embed = build_ad_alert_embed(
+                    title=f"[{alert['level']}] Ad Performance Alert",
+                    description=alert["message"],
+                    severity=alert["level"],
+                    fields={
+                        "Category": alert.get("category", "-"),
+                        "Period": f"{start_date} to {end_date}",
+                    },
+                )
+                alert_embeds.append(embed)
+            send_discord_notification(
+                DISCORD_WEBHOOK_AD_ALERT,
+                content="",
+                embeds=alert_embeds,
+            )
+
+        # Send daily summary to daily report channel (skip if --json-only)
+        if DISCORD_WEBHOOK_DAILY_REPORT:
+            if campaign is not None:
+                ctr_pct = f"{campaign['ctr'] * 100:.2f}%"
+                clicks_str = f"{campaign['clicks']:,}"
+                impressions_str = f"{campaign['impressions']:,}"
+                cost_str = f"${campaign['cost_dollars']:.2f}"
+            else:
+                ctr_pct = "-"
+                clicks_str = "-"
+                impressions_str = "-"
+                cost_str = "-"
+
+            pause_count = len(paused_log)
+            alert_severity = "SUCCESS"
+            if any(a["level"] == "CRITICAL" for a in alerts):
+                alert_severity = "CRITICAL"
+            elif any(a["level"] == "WARNING" for a in alerts):
+                alert_severity = "WARNING"
+
+            summary_description = f"Campaigns: {', '.join(CAMPAIGN_NAMES)}\nPeriod: {start_date} to {end_date}"
+            if not bq_save_ok:
+                summary_description += "\n\n[WARNING] BQ data save failed"
+            summary_embed = build_ad_alert_embed(
+                title="Daily Ad Performance Summary",
+                description=summary_description,
+                severity=alert_severity if bq_save_ok else "WARNING",
+                fields={
+                    "CTR": ctr_pct,
+                    "Clicks": clicks_str,
+                    "Impressions": impressions_str,
+                    "Cost": cost_str,
+                    "PAUSE count": str(pause_count),
+                },
+            )
+            send_discord_notification(
+                DISCORD_WEBHOOK_DAILY_REPORT,
+                content="",
+                embeds=[summary_embed],
+            )
+
+    # ----------------------------------------------------------------
+    # Weekly summary (auto-send every Monday)
+    # ----------------------------------------------------------------
+    is_monday = datetime.today().weekday() == 0
+    should_weekly = getattr(args, "weekly_summary", False) or is_monday
+
+    if should_weekly and args.discord and DISCORD_WEBHOOK_DAILY_REPORT:
+        if not args.json_only:
+            print("\n[INFO] Sending weekly summary to Discord...")
+        weekly_embed = build_weekly_summary_embed(
+            campaign, keywords, alerts, paused_log, suggestions,
+            start_date, end_date,
+        )
+        send_discord_notification(
+            DISCORD_WEBHOOK_DAILY_REPORT,
+            content="",
+            embeds=[weekly_embed],
+        )
+
+    # ----------------------------------------------------------------
+    # Search term analysis (--analyze-search-terms or auto every Monday)
+    # ----------------------------------------------------------------
+    should_analyze = getattr(args, "analyze_search_terms", False) or is_monday
+
+    if should_analyze and not args.json_only:
+        if is_monday and not getattr(args, "analyze_search_terms", False):
+            print("\n[INFO] Monday: running search term analysis automatically...")
+        else:
+            print("\n[INFO] Running search term analysis...")
+        try:
+            search_terms_mod.run(
+                days=args.days,
+                save_bq=args.save_bq,
+                execute=False,     # Do not add exclusions for manual-specified runs
+                discord=args.discord,
+                auto_execute=True,  # Auto-exclude high-confidence candidates (score>=7)
+            )
+        except Exception as e:
+            logger.error("Error in search term analysis: %s", e)
+
+    # ----------------------------------------------------------------
+    # Tier promotion check (auto daily)
+    # ----------------------------------------------------------------
+    if not args.json_only:
+        tier_result = check_tier_promotion(ad_groups, keywords, discord=args.discord)
+        if tier_result:
+            if tier_result["ready"]:
+                print("\n[INFO] Tier 2 promotion conditions met!")
+            else:
+                print("\n[INFO] Tier 2 promotion: not yet")
+                for detail in tier_result["tier1_details"]:
+                    print(f"  {detail}")
+                if tier_result["qs_issues"]:
+                    print("  QS issues:")
+                    for qs in tier_result["qs_issues"]:
+                        print(f"    {qs}")
+
+
+if __name__ == "__main__":
+    main()
