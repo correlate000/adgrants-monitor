@@ -1,0 +1,22 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["reports"]
+
+# Start with real-bug rules (F-series: pyflakes) and common whitespace
+# mistakes (W). Skip import ordering (I) and most style rules until the
+# existing codebase has been sorted manually. Tighten over time.
+[tool.ruff.lint]
+select = ["F", "W"]
+ignore = [
+    "F401",  # pre-existing unused imports; clean up incrementally
+    "F841",  # assigned-but-unused locals
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]

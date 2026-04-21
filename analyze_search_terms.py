@@ -36,8 +36,17 @@ from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
 from config import CAMPAIGN_NAME, CUSTOMER_ID
-from ads_common.constants import MAX_AUTO_EXCLUDE_PER_RUN
+from ads_common.constants import (
+    BQ_DATASET_ID,
+    BQ_PROJECT_ID,
+    MAX_AUTO_EXCLUDE_PER_RUN,
+    SCORE_AUTO_EXECUTE,
+    SCORE_CANDIDATE,
+    SCORE_HIGH,
+)
+from ads_common.ads_client import get_google_ads_client
 from ads_common.gaql import validate_gaql_value
+from ads_common.time import build_date_range as _build_date_range_jst
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,21 +59,16 @@ SCRIPT_DIR = Path(__file__).parent
 YAML_PATH = SCRIPT_DIR / "google-ads.yaml"
 SA_KEY_PATH = Path(os.path.expanduser("~/.config/gcloud/local-scripts-sa-key.json"))
 
-BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", "")
-BQ_DATASET_ID = os.environ.get("BQ_DATASET_ID", "")
 BQ_TABLE_ID = "ad_search_terms"
 BQ_TABLE_FULL = f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{BQ_TABLE_ID}"
 
 load_dotenv(SCRIPT_DIR / ".env")
 DISCORD_WEBHOOK_AD_ALERT = os.environ.get("DISCORD_WEBHOOK_AD_ALERT", "")
 
-# Score thresholds
-SCORE_CANDIDATE = 2    # >= this -> exclusion candidate
-SCORE_HIGH = 5         # >= this -> high priority (Discord alert, --execute target)
-                       # Note: During early operation (1-2 weeks after adding KWs), impressions may
-                       # be too low to reach score>=5. Start with 3-4 and raise to 5 once data accumulates.
-SCORE_AUTO_EXECUTE = 7  # >= this -> auto-exclude (with --auto-execute)
-# MAX_AUTO_EXCLUDE_PER_RUN is imported from ads_common.constants
+# Score thresholds (SCORE_CANDIDATE/SCORE_HIGH/SCORE_AUTO_EXECUTE imported above).
+# Note: During early operation (1-2 weeks after adding KWs), impressions may be
+# too low to reach SCORE_HIGH (5). If needed, tune the constants in
+# ads_common/constants.py rather than shadowing them here.
 
 # ================================================================
 # Suspicious patterns (EXACT match may misfire but context should be excluded)
@@ -152,36 +156,43 @@ def _build_campaign_id_query(campaign_name: str) -> str:
 # ================================================================
 
 def build_date_range(days: int) -> tuple[str, str]:
-    today = datetime.now(timezone.utc).date()
-    end = today - timedelta(days=1)
-    start = end - timedelta(days=days - 1)
-    return str(start), str(end)
+    """Return a JST-based (start, end) range that ends yesterday.
+
+    Search-term data for today is incomplete in the Google Ads API, so the
+    window stops at end_offset=1 (yesterday).
+    """
+    return _build_date_range_jst(days, end_offset=1)
 
 
 def fetch_search_terms(client, start_date: str, end_date: str) -> list[dict]:
+    """Fetch search-term rows. Raises GoogleAdsException on API failure.
+
+    Library code must not call sys.exit — the CLI entrypoint (run()/main())
+    decides whether an API error is fatal.
+    """
     ga_service = client.get_service("GoogleAdsService")
     query = build_search_term_query(CAMPAIGN_NAME, start_date, end_date)
     try:
         response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
-        rows = []
-        for row in response:
-            rows.append({
-                "search_term": row.search_term_view.search_term,
-                "status": row.search_term_view.status.name,  # ADDED/EXCLUDED/NONE
-                "ad_group": row.ad_group.name,
-                "impressions": row.metrics.impressions,
-                "clicks": row.metrics.clicks,
-                "ctr": row.metrics.ctr,
-                "cost_micros": row.metrics.cost_micros,
-                "conversions": row.metrics.conversions,
-            })
-        logger.info("Search terms fetched: %d rows (%s to %s)", len(rows), start_date, end_date)
-        return rows
     except GoogleAdsException as ex:
         logger.error("Google Ads API error: %s", ex.error.code().name)
         for error in ex.failure.errors:
             logger.error("  %s", error.message)
-        sys.exit(1)
+        raise
+    rows = []
+    for row in response:
+        rows.append({
+            "search_term": row.search_term_view.search_term,
+            "status": row.search_term_view.status.name,  # ADDED/EXCLUDED/NONE
+            "ad_group": row.ad_group.name,
+            "impressions": row.metrics.impressions,
+            "clicks": row.metrics.clicks,
+            "ctr": row.metrics.ctr,
+            "cost_micros": row.metrics.cost_micros,
+            "conversions": row.metrics.conversions,
+        })
+    logger.info("Search terms fetched: %d rows (%s to %s)", len(rows), start_date, end_date)
+    return rows
 
 
 # ================================================================
@@ -707,7 +718,7 @@ def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bo
     """Run analysis and return list of scored rows."""
     start_date, end_date = build_date_range(days)
 
-    client = GoogleAdsClient.load_from_storage(str(YAML_PATH))
+    client = get_google_ads_client(YAML_PATH)
     rows = fetch_search_terms(client, start_date, end_date)
 
     if not rows:
@@ -817,13 +828,17 @@ Usage examples:
 
 def main() -> None:
     args = parse_args()
-    run(
-        days=args.days,
-        save_bq=args.save_bq,
-        execute=args.execute,
-        discord=args.discord,
-        auto_execute=args.auto_execute,
-    )
+    try:
+        run(
+            days=args.days,
+            save_bq=args.save_bq,
+            execute=args.execute,
+            discord=args.discord,
+            auto_execute=args.auto_execute,
+        )
+    except GoogleAdsException:
+        # Error already logged in fetch_search_terms; exit non-zero so cron surfaces it.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

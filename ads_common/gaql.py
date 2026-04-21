@@ -5,13 +5,21 @@ import unicodedata
 
 
 def validate_gaql_value(value: str, field_name: str) -> str:
-    """Validate a value to be embedded in a GAQL query."""
+    """Validate a value to be embedded in a GAQL query.
+
+    Rejects anything that could break out of the surrounding single-quoted
+    literal or inject a new clause: quotes, semicolons, and any whitespace
+    other than ASCII space. The regex intentionally does NOT use \\s,
+    because \\s matches \\n/\\r/\\t — characters that could smuggle a new
+    GAQL clause past the validator.
+    """
     if field_name == "date":
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
             raise ValueError(f"Invalid date format: {value}")
     elif field_name in ("campaign_name", "ad_group"):
-        # Allow Japanese (hiragana/katakana/kanji), alphanumeric, space, hyphen, middle dot, full-width symbols
-        if not re.match(r"^[\w\s\-\u3000-\u9FFF\uFF00-\uFFEF・]+$", value):
+        # ASCII alphanumerics/underscore, literal ASCII space, hyphen,
+        # Japanese (hiragana/katakana/kanji), full-width symbols, middle dot.
+        if not re.match(r"^[\w \-　-鿿＀-￯・]+$", value):
             raise ValueError(f"Invalid {field_name}: {value}")
     return value
 

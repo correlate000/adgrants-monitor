@@ -25,6 +25,11 @@ EXCLUSION_GRADUATION_MIN_IMP = 10
 # Auto-exclude limits (analyze_search_terms)
 MAX_AUTO_EXCLUDE_PER_RUN = 5  # Safety guard for automated exclusion
 
+# Search-term scoring thresholds (analyze_search_terms)
+SCORE_CANDIDATE = 2       # >= this -> exclusion candidate (shown in report)
+SCORE_HIGH = 5            # >= this -> high priority (Discord alert, --execute target)
+SCORE_AUTO_EXECUTE = 7    # >= this -> auto-exclude (with --auto-execute)
+
 # Tier promotion criteria
 TIER_PROMOTION_MIN_DAYS = 14   # Minimum 14 days of observation
 TIER_PROMOTION_MIN_CTR = 0.05  # CTR >= 5%

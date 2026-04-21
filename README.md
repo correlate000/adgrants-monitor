@@ -255,6 +255,52 @@ python monitor_ad_performance.py --undo
 
 ---
 
+## Runbook
+
+### CTR dropped below 5% (account-wide)
+
+Ad Grants will suspend the account if the 5%-CTR requirement is breached repeatedly. If `monitor_ad_performance.py` reports `CRITICAL`:
+
+1. **Identify the bleed.** Run `python monitor_ad_performance.py --weekly` to see which campaign pulled the average down.
+2. **Pause low-CTR keywords.** Run `python monitor_ad_performance.py` (no flags) — this respects the `MAX_PAUSE_PER_RUN=3` / `MAX_PAUSE_PER_DAY=5` safety limits.
+3. **If the account-wide CTR is still under 5% after pauses**, consider pausing entire under-performing ad groups manually in the Google Ads UI. Never lower `MIN_ENABLED_KEYWORDS=5`.
+4. **Confirm with the daily BigQuery snapshot** (`ad_campaign_daily`) that the trend reverses the next day.
+
+### `--undo` fails or `pause_log.json` is corrupted
+
+`pause_log.json` is the source of truth for the last 100 pauses. If it's missing or corrupt, `load_pause_log()` falls back to `ad_actions_log` in BigQuery automatically.
+
+- **If `pause_log.json` is missing:** no action needed — next run rebuilds it from BQ.
+- **If `pause_log.json` is malformed JSON:** delete it and run `--undo-date YYYY-MM-DD` for the affected day. The BQ fallback will supply the pause list.
+- **If both are unavailable:** re-enable the affected keywords manually via the Google Ads UI. `pause_exclusion_list.json` will prevent the next monitor run from re-pausing them.
+
+### Tests are failing in CI but pass locally
+
+- CI uses Python 3.12; confirm your local interpreter (`python --version`).
+- If a test touches `monitor_ad_performance.py`, it uses `importlib.reload()` with a patched `config.CAMPAIGN_PAUSE_TYPE`. Make sure `config.py` is unchanged in your branch.
+
+### Rotating the service-account key
+
+The BigQuery service-account key path is controlled by `BQ_SA_KEY_PATH` (defaults to `~/.config/gcloud/local-scripts-sa-key.json`). To rotate:
+
+1. Drop the new key at the same path, or set `BQ_SA_KEY_PATH=/new/path` in `.env`.
+2. Run `python monitor_ad_performance.py --weekly` and confirm it prints `[BQ] ad_campaign_daily: saved N rows`.
+
+### Tier 1 → Tier 2 promotion
+
+`monitor_ad_performance.py` checks daily whether AG-01…AG-05 (the Tier 1 ad groups) have reached ≥5% CTR and ≥3 Quality Score for 14 consecutive days. When the criteria are met the script prints `[INFO] Tier 2 promotion conditions met!` (and sends a Discord notification with `--discord`). Promotion is reported only — no automatic reclassification happens.
+
+### Verifying changes before merging
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest                     # must be green
+ruff check .               # must be green
+python monitor_ad_performance.py --dry-run  # optional end-to-end smoke
+```
+
+---
+
 ## License
 
 MIT License — see [LICENSE](LICENSE).

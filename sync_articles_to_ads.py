@@ -25,6 +25,7 @@ Environment variables:
 """
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -35,6 +36,16 @@ from typing import Optional
 
 import anthropic
 import yaml
+
+from ads_common.ads_client import get_google_ads_client
+from ads_common.gaql import display_width
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # Load .env if present
 try:
@@ -109,14 +120,6 @@ def _validate_resource_name(resource_name: str) -> bool:
     return bool(re.match(r'^customers/\d+/\w+/\d+$', resource_name))
 
 
-def display_width(s: str) -> int:
-    """String display width (full-width=2, half-width=1)"""
-    return sum(
-        2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
-        for c in s
-    )
-
-
 def truncate_to_width(s: str, max_width: int) -> str:
     """Truncate string to fit within the display width limit"""
     result = ""
@@ -134,7 +137,6 @@ def send_discord(title: str, description: str, severity: str, fields: dict) -> N
     """Send notification to Discord Webhook (skipped if httpx is not available)"""
     if not DISCORD_WEBHOOK or not HTTPX_AVAILABLE:
         return
-    from datetime import datetime, timezone, timedelta
     color_map = {
         "CRITICAL": 15158332,
         "WARNING": 15105826,
@@ -153,7 +155,7 @@ def send_discord(title: str, description: str, severity: str, fields: dict) -> N
     try:
         httpx.post(DISCORD_WEBHOOK, json={"content": "", "embeds": [embed]}, timeout=10)
     except Exception as e:
-        print(f"  [WARN] Discord notification failed: {e}", file=sys.stderr)
+        logger.warning("Discord notification failed: %s", e)
 
 
 # ===========================================================================
@@ -192,7 +194,7 @@ def read_article_frontmatter(slug: str) -> Optional[dict]:
     """Read MDX article frontmatter (gray-matter compatible)"""
     found = _find_content_file(slug)
     if not found:
-        print(f"  [ERROR] Article not found: {slug}", file=sys.stderr)
+        logger.error("Article not found: %s", slug)
         return None
 
     target, category = found
@@ -221,10 +223,10 @@ def read_article_frontmatter(slug: str) -> Optional[dict]:
                     "body_preview": body[:500],  # First 500 chars for keyword extraction
                 }
             except yaml.YAMLError as e:
-                print(f"  [ERROR] Frontmatter parse failed: {e}", file=sys.stderr)
+                logger.error("Frontmatter parse failed for %s: %s", slug, e)
                 return None
 
-    print(f"  [WARN] No frontmatter found: {slug}", file=sys.stderr)
+    logger.warning("No frontmatter found: %s", slug)
     return {"slug": slug, "category": category, "title": slug, "summary": "", "tags": [], "status": "", "body_preview": ""}
 
 
@@ -342,7 +344,7 @@ def extract_keywords_with_claude(article: dict) -> list[str]:
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("  [WARN] ANTHROPIC_API_KEY not set. Skipping keyword generation.", file=sys.stderr)
+        logger.warning("ANTHROPIC_API_KEY not set. Skipping keyword generation.")
         return []
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -389,7 +391,7 @@ Keyword candidates:"""
                 keywords.append(kw)
         return keywords[:8]
     except Exception as e:
-        print(f"  [WARN] Claude API error: {e}", file=sys.stderr)
+        logger.warning("Claude API error: %s", e)
         return []
 
 
@@ -552,7 +554,7 @@ def get_or_create_campaign_resource(client, ga_service) -> Optional[tuple[str, s
             campaign_service.mutate_campaigns(
                 customer_id=CUSTOMER_ID, operations=[campaign_op]
             )
-            print(f"  [OK] Campaign changed to ENABLED")
+            print("  [OK] Campaign changed to ENABLED")
             status_name = "ENABLED"
 
         return resource_name, status_name
@@ -738,7 +740,7 @@ def sync_keywords(client, ga_service, ad_group_resource: str, keywords: list[str
                 err_detail = f" [{kw_ex.failure.errors[0].error_code}] {kw_ex.failure.errors[0].message}"
             except Exception:
                 pass
-            print(f"    [WARN] KW rejected ({err_detail.strip() or 'GoogleAdsException'}): {kw}", file=sys.stderr)
+            logger.warning("KW rejected (%s): %s", err_detail.strip() or "GoogleAdsException", kw)
             rejected.append(kw)
     return added, rejected
 
@@ -866,7 +868,7 @@ def sync_article(slug: str, dry_run: bool, force: bool,
     if dry_run:
         article_status = _infer_article_status(article)
         ag_status = "ENABLED" if article_status == "published" else "PAUSED"
-        print(f"\n  [DRY-RUN] No actual API calls")
+        print("\n  [DRY-RUN] No actual API calls")
         print(f"  Campaign: {CAMPAIGN_NAME} (ENABLED)")
         print(f"  Ad group: article: {slug} ({ag_status} <- status: {article_status})")
         print(f"  Landing page: {final_url}")
@@ -887,16 +889,16 @@ def sync_article(slug: str, dry_run: bool, force: bool,
 
     # 4. Check Google Ads API availability
     if not GOOGLE_ADS_AVAILABLE:
-        print("  [ERROR] google-ads package not found: pip install google-ads", file=sys.stderr)
+        logger.error("google-ads package not found: pip install google-ads")
         return {"slug": slug, "success": False, "message": "google-ads not installed"}
 
     if not GOOGLE_ADS_YAML.exists():
-        print(f"  [ERROR] google-ads.yaml not found: {GOOGLE_ADS_YAML}", file=sys.stderr)
+        logger.error("google-ads.yaml not found: %s", GOOGLE_ADS_YAML)
         return {"slug": slug, "success": False, "message": "google-ads.yaml not found"}
 
     # 5. Sync via Google Ads API
     try:
-        client = ads_client or GoogleAdsClient.load_from_storage(str(GOOGLE_ADS_YAML))
+        client = ads_client or get_google_ads_client(GOOGLE_ADS_YAML)
         svc = ga_service or client.get_service("GoogleAdsService")
 
         if campaign_info:
@@ -926,7 +928,7 @@ def sync_article(slug: str, dry_run: bool, force: bool,
             if is_policy:
                 rsa_policy_error = rsa_ex.failure.errors[0].message
                 rsa_action = "policy_violation"
-                print(f"  [WARN] RSA policy violation, skipping (existing RSA preserved): {rsa_policy_error}", file=sys.stderr)
+                logger.warning("RSA policy violation, skipping (existing RSA preserved): %s", rsa_policy_error)
             else:
                 raise  # Re-raise non-policy errors
 
@@ -966,7 +968,7 @@ def sync_article(slug: str, dry_run: bool, force: bool,
 
     except GoogleAdsException as ex:
         err = f"Google Ads API error: {ex.error.code().name}"
-        print(f"  [ERROR] {err}", file=sys.stderr)
+        logger.error("%s", err)
         send_discord(
             title=f"[ERROR] Article -> Ad Grants sync failed: {slug}",
             description=err,
@@ -990,7 +992,7 @@ def main():
     else:
         slugs = list_all_articles()
         if not slugs:
-            print("No articles found.", file=sys.stderr)
+            logger.warning("No articles found.")
             sys.exit(1)
 
     print(f"Target: {len(slugs)} articles")
@@ -1002,7 +1004,7 @@ def main():
     ads_ga_service = None
     campaign_info = None
     if not args.dry_run and GOOGLE_ADS_AVAILABLE and GOOGLE_ADS_YAML.exists():
-        ads_client = GoogleAdsClient.load_from_storage(str(GOOGLE_ADS_YAML))
+        ads_client = get_google_ads_client(GOOGLE_ADS_YAML)
         ads_ga_service = ads_client.get_service("GoogleAdsService")
         campaign_info = get_or_create_campaign_resource(ads_client, ads_ga_service)
 
@@ -1013,14 +1015,14 @@ def main():
                                   ads_client=ads_client, ga_service=ads_ga_service,
                                   campaign_info=campaign_info)
         except Exception as e:
-            print(f"\n[{slug}] [ERROR] Unexpected error: {e}", file=sys.stderr)
+            logger.error("[%s] Unexpected error: %s", slug, e)
             result = {"slug": slug, "success": False, "message": f"Unexpected error: {e}"}
         results.append(result)
 
     # Summary
     success = sum(1 for r in results if r["success"])
     fail = len(results) - success
-    print(f"\n=== Complete ===")
+    print("\n=== Complete ===")
     print(f"Success: {success} / Failed: {fail} / Total: {len(results)}")
 
     if fail > 0:

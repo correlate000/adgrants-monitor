@@ -35,7 +35,26 @@ from google.cloud import bigquery
 from google.protobuf import field_mask_pb2
 
 from config import CAMPAIGN_NAME, CAMPAIGN_NAMES, CAMPAIGN_PAUSE_TYPE, CUSTOMER_ID
+from ads_common.constants import (
+    BQ_BATCH_SIZE,
+    BQ_DATASET_ID,
+    BQ_PROJECT_ID,
+    CTR_AD_GROUP_MIN,
+    CTR_CRITICAL_THRESHOLD,
+    CTR_EARLY_WARNING_THRESHOLD,
+    CTR_KW_PAUSE_50IMP,
+    CTR_KW_PAUSE_100IMP,
+    CTR_WARNING_THRESHOLD,
+    EXCLUSION_GRADUATION_MIN_IMP,
+    MAX_PAUSE_PER_DAY,
+    MAX_PAUSE_PER_RUN,
+    MIN_ENABLED_KEYWORDS,
+    QS_MIN,
+)
+from ads_common.ads_client import get_google_ads_client
+from ads_common.bq import get_bq_client
 from ads_common.gaql import validate_gaql_value
+from ads_common.time import JST, build_date_range, jst_today
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,27 +63,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Ad Grants CTR thresholds
-CTR_CRITICAL_THRESHOLD = 0.05   # 5% or below -> CRITICAL (risk of suspension)
-CTR_WARNING_THRESHOLD = 0.07    # 7% or below -> WARNING (approaching danger zone)
-CTR_AD_GROUP_MIN = 0.05         # Per ad group: WARNING if < 5%
-QS_MIN = 3                      # Ad Grants minimum quality score
-
-# Per-campaign PAUSE criteria (type definitions in config.CAMPAIGN_PAUSE_TYPE)
+# Script-specific PAUSE criterion (CTR thresholds and safety guards are in
+# ads_common/constants.py — imported above).
 CV_PAUSE_MIN_CLICKS = 20        # cv type: pause if click >= 20 and CV < 0.5
-CTR_KW_PAUSE_100IMP = 0.03      # ctr type: auto-pause if 100+ imp and CTR < 3%
-CTR_KW_PAUSE_50IMP = 0.02       # ctr type: auto-pause if 50+ imp and CTR < 2%
-CTR_EARLY_WARNING_THRESHOLD = 0.06  # 6% -> early warning
-
-# Safety guards
-MAX_PAUSE_PER_RUN = 3           # Max 3 keywords paused per run
-MAX_PAUSE_PER_DAY = 5           # Max cumulative pauses per day
-MIN_ENABLED_KEYWORDS = 5        # Minimum enabled keywords remaining after PAUSE
-
-# Auto-pause exclusion list (managed via JSON)
-# Do not edit directly - update pause_exclusion_list.json instead
-# Graduation criteria: QS >= QS_MIN and imp >= EXCLUSION_GRADUATION_MIN_IMP
-EXCLUSION_GRADUATION_MIN_IMP = 10  # Minimum impressions to graduate from exclusion list
 
 # Report output directory
 SCRIPT_DIR = Path(__file__).parent
@@ -73,11 +74,8 @@ YAML_PATH = SCRIPT_DIR / "google-ads.yaml"
 PAUSE_LOG_PATH = SCRIPT_DIR / "pause_log.json"
 PAUSE_EXCLUSION_FILE = SCRIPT_DIR / "pause_exclusion_list.json"
 
-# BigQuery configuration
+# BigQuery credentials (project/dataset/batch-size are imported from ads_common).
 SA_KEY_PATH = Path(os.path.expanduser("~/.config/gcloud/local-scripts-sa-key.json"))
-BQ_PROJECT_ID = os.environ.get("BQ_PROJECT_ID", "")
-BQ_DATASET_ID = os.environ.get("BQ_DATASET_ID", "")
-BQ_BATCH_SIZE = 1000
 
 # Load .env (Discord notifications are skipped if not configured)
 load_dotenv(SCRIPT_DIR / ".env")
@@ -386,16 +384,39 @@ def format_ctr_raw(ctr: float) -> str:
     return f"{ctr * 100:.2f}%"
 
 
+def _assert_pause_type_prefixes_unambiguous() -> None:
+    """Fail fast if any CAMPAIGN_PAUSE_TYPE key is a prefix of another.
+
+    Without this guard a key like "IT" would silently match every campaign
+    starting with "IT" (including "IT適性診断"), and the dict iteration
+    order would decide which strategy wins.
+    """
+    keys = list(CAMPAIGN_PAUSE_TYPE.keys())
+    for i, a in enumerate(keys):
+        for b in keys[i + 1:]:
+            if a == b:
+                continue
+            if a.startswith(b) or b.startswith(a):
+                raise ValueError(
+                    f"CAMPAIGN_PAUSE_TYPE has ambiguous prefix keys: {a!r} and {b!r}. "
+                    "Rename one so neither is a prefix of the other."
+                )
+
+
+_assert_pause_type_prefixes_unambiguous()
+
+
 def get_campaign_pause_type(campaign_name: str) -> str | None:
     """Return PAUSE strategy type from campaign name.
 
-    Prefix match against CAMPAIGN_PAUSE_TYPE keys.
-    Returns None if no match (not subject to auto-PAUSE).
+    Prefix match against CAMPAIGN_PAUSE_TYPE keys, choosing the LONGEST
+    matching prefix. Returns None if no match (not subject to auto-PAUSE).
     """
+    best: tuple[int, str | None] = (-1, None)
     for prefix, pause_type in CAMPAIGN_PAUSE_TYPE.items():
-        if campaign_name.startswith(prefix):
-            return pause_type
-    return None
+        if campaign_name.startswith(prefix) and len(prefix) > best[0]:
+            best = (len(prefix), pause_type)
+    return best[1]
 
 
 def is_pause_target(kw: dict) -> tuple[bool, str | None]:
@@ -430,15 +451,6 @@ def is_pause_target(kw: dict) -> tuple[bool, str | None]:
 
     # pause_type is None -> no auto-pause except QS<=1
     return False, None
-
-
-JST = timezone(timedelta(hours=9))
-
-
-def build_date_range(days: int) -> tuple[str, str]:
-    end = datetime.now(tz=JST)
-    start = end - timedelta(days=days - 1)
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
 def build_campaign_filter(campaign_names: list[str] | None = None) -> str:
@@ -822,7 +834,7 @@ def pause_keywords(
         return paused_log
 
     # ===== Safety guard: count check =====
-    today_str = datetime.now(tz=JST).strftime("%Y-%m-%d")
+    today_str = jst_today()
     existing_log = load_pause_log()
     today_paused_count = sum(1 for e in existing_log if e.get("date") == today_str)
 
@@ -963,7 +975,7 @@ def pause_keywords(
             # Discord: individual PAUSE notification
             if discord:
                 embed = build_ad_alert_embed(
-                    title=f"Keyword PAUSED",
+                    title="Keyword PAUSED",
                     description=f"'{kw['keyword_text']}' has been paused.",
                     severity="WARNING",
                     fields={
@@ -1117,6 +1129,221 @@ def generate_keyword_suggestions(keywords: list[dict]) -> dict:
 
 # ===== BigQuery Storage =====
 
+def _insert_rows_batched(bq_client, table_name: str, rows: list[dict]) -> bool:
+    """Insert rows in BQ_BATCH_SIZE chunks. Returns True iff every batch succeeded."""
+    bq_table = bq_client.get_table(f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.{table_name}")
+    ok = True
+    for i in range(0, len(rows), BQ_BATCH_SIZE):
+        batch = rows[i:i + BQ_BATCH_SIZE]
+        errors = bq_client.insert_rows_json(bq_table, batch)
+        if errors:
+            logger.warning(
+                "%s INSERT error (batch %d): %s",
+                table_name,
+                i // BQ_BATCH_SIZE + 1,
+                errors,
+            )
+            ok = False
+    return ok
+
+
+def _idempotent_delete(bq_client, table_name: str, sql: str,
+                       params: list) -> bool:
+    """Run an idempotent DELETE. Returns False if the streaming buffer blocks it."""
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    try:
+        bq_client.query(sql, job_config=job_config).result()
+        return True
+    except BadRequest as e:
+        if "streaming buffer" in str(e):
+            logger.info("%s: Skipping DELETE+INSERT due to streaming buffer", table_name)
+            return False
+        raise
+
+
+def _save_campaign_daily(
+    bq_client,
+    ga_service,
+    start_date: str,
+    end_date: str,
+    account_id: str,
+    alerts: list[dict],
+    now_ts: str,
+) -> bool:
+    """Save daily per-campaign metrics to ad_campaign_daily."""
+    table_camp = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_campaign_daily`"
+    delete_sql = f"""
+        DELETE FROM {table_camp}
+        WHERE date BETWEEN @start_date AND @end_date
+          AND account_id = @account_id
+    """
+    params = [
+        bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
+        bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
+        bigquery.ScalarQueryParameter("account_id", "STRING", account_id),
+    ]
+    try:
+        if not _idempotent_delete(bq_client, "ad_campaign_daily", delete_sql, params):
+            return True  # streaming buffer blocked DELETE; next run will refresh
+
+        daily_query = BQ_DAILY_CAMPAIGN_QUERY.format(
+            start_date=_validate_gaql_value(start_date, "date"),
+            end_date=_validate_gaql_value(end_date, "date"),
+        )
+        response = ga_service.search(customer_id=CUSTOMER_ID, query=daily_query)
+        alert_count = len([a for a in alerts if a.get("level") in ("CRITICAL", "WARNING")])
+
+        rows_camp = [
+            {
+                "date": row.segments.date,
+                "account_id": account_id,
+                "campaign_id": str(row.campaign.id),
+                "campaign_name": row.campaign.name,
+                "impressions": row.metrics.impressions,
+                "clicks": row.metrics.clicks,
+                "ctr": row.metrics.ctr,
+                "cost": row.metrics.cost_micros / 1_000_000,
+                "conversions": row.metrics.conversions,
+                "daily_budget": row.campaign_budget.amount_micros / 1_000_000,
+                "campaign_status": row.campaign.status.name,
+                "active_keywords": None,
+                "paused_keywords": None,
+                "alert_count": alert_count,
+                "synced_at": now_ts,
+            }
+            for row in response
+        ]
+
+        if not rows_camp:
+            print("[BQ] ad_campaign_daily: no data (skipped)")
+            return True
+
+        ok = _insert_rows_batched(bq_client, "ad_campaign_daily", rows_camp)
+        if ok:
+            print(f"[BQ] ad_campaign_daily: saved {len(rows_camp)} rows")
+        return ok
+    except GoogleAdsException as ex:
+        logger.warning("ad_campaign_daily Google Ads API error: %s", ex)
+        return False
+    except Exception as e:
+        logger.warning("Failed to save ad_campaign_daily: %s", e)
+        return False
+
+
+def _save_keyword_performance(
+    bq_client,
+    ga_service,
+    start_date: str,
+    end_date: str,
+    account_id: str,
+    now_ts: str,
+) -> bool:
+    """Save previous-day keyword snapshot to ad_keyword_performance."""
+    kw_snapshot_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    if kw_snapshot_date < start_date:
+        kw_snapshot_date = start_date
+
+    table_kw = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_keyword_performance`"
+    delete_sql = f"""
+        DELETE FROM {table_kw}
+        WHERE date = @date
+          AND account_id = @account_id
+    """
+    params = [
+        bigquery.ScalarQueryParameter("date", "DATE", kw_snapshot_date),
+        bigquery.ScalarQueryParameter("account_id", "STRING", account_id),
+    ]
+    try:
+        if not _idempotent_delete(bq_client, "ad_keyword_performance", delete_sql, params):
+            print("[BQ] ad_keyword_performance: streaming buffer active (next run will refresh)")
+            return True
+
+        kw_query = BQ_DAILY_KEYWORD_QUERY.format(
+            date=_validate_gaql_value(kw_snapshot_date, "date"),
+        )
+        response = ga_service.search(customer_id=CUSTOMER_ID, query=kw_query)
+
+        rows_kw = []
+        for row in response:
+            qs = row.ad_group_criterion.quality_info.quality_score
+            rows_kw.append({
+                "date": kw_snapshot_date,
+                "account_id": account_id,
+                "campaign_id": str(row.campaign.id),
+                "campaign_name": row.campaign.name,
+                "ad_group_id": str(row.ad_group.id),
+                "ad_group_name": row.ad_group.name,
+                "keyword_id": str(row.ad_group_criterion.criterion_id),
+                "keyword_text": row.ad_group_criterion.keyword.text,
+                "match_type": row.ad_group_criterion.keyword.match_type.name,
+                "impressions": row.metrics.impressions,
+                "clicks": row.metrics.clicks,
+                "ctr": row.metrics.ctr,
+                "cost_micros": row.metrics.cost_micros,
+                "cost": row.metrics.cost_micros / 1_000_000,
+                "conversions": row.metrics.conversions,
+                "quality_score": qs if qs and qs > 0 else None,
+                "avg_cpc_micros": int(row.metrics.average_cpc),
+                "keyword_status": row.ad_group_criterion.status.name,
+                "synced_at": now_ts,
+            })
+
+        if not rows_kw:
+            print("[BQ] ad_keyword_performance: no data (skipped)")
+            return True
+
+        ok = _insert_rows_batched(bq_client, "ad_keyword_performance", rows_kw)
+        if ok:
+            print(f"[BQ] ad_keyword_performance: saved {len(rows_kw)} rows")
+        return ok
+    except GoogleAdsException as ex:
+        logger.warning("ad_keyword_performance Google Ads API error: %s", ex)
+        return False
+    except Exception as e:
+        logger.warning("Failed to save ad_keyword_performance: %s", e)
+        return False
+
+
+def _save_actions_log(
+    bq_client,
+    paused_log: list[dict],
+    account_id: str,
+    now_ts: str,
+) -> bool:
+    """Insert realized (non-dry-run) PAUSE actions to ad_actions_log."""
+    actual_pauses = [p for p in paused_log if not p.get("dry_run", True)]
+    if not actual_pauses:
+        return True
+    try:
+        today_str = jst_today()
+        rows_action = [
+            {
+                "id": str(uuid.uuid4()),
+                "date": today_str,
+                "account_id": account_id,
+                "action_type": "PAUSE",
+                "target_type": "KEYWORD",
+                "target_id": str(p.get("criterion_id", "")),
+                "target_name": p.get("keyword_text", ""),
+                "reason": p.get("reason", ""),
+                "dry_run": False,
+                "previous_status": "ENABLED",
+                "created_at": now_ts,
+            }
+            for p in actual_pauses
+        ]
+        bq_table = bq_client.get_table(f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_actions_log")
+        errors = bq_client.insert_rows_json(bq_table, rows_action)
+        if errors:
+            logger.warning("ad_actions_log INSERT error: %s", errors)
+            return False
+        print(f"[BQ] ad_actions_log: saved {len(rows_action)} rows")
+        return True
+    except Exception as e:
+        logger.warning("Failed to save ad_actions_log: %s", e)
+        return False
+
+
 def save_to_bigquery(
     client,
     start_date: str,
@@ -1124,245 +1351,31 @@ def save_to_bigquery(
     alerts: list[dict],
     paused_log: list[dict],
 ) -> bool:
-    """Save performance data to BigQuery.
+    """Save performance data to BigQuery (daily granularity, all campaigns).
 
-    Saves daily-granularity data for all campaigns.
-    Re-fetches from Google Ads API with segments.date for per-day per-campaign storage.
-    Ensures idempotency via DELETE before INSERT.
+    Writes three tables, each idempotent via DELETE-then-INSERT:
+    - ad_campaign_daily: daily x per-campaign (partitioned by segments.date)
+    - ad_keyword_performance: keyword snapshot at end_date - 1
+    - ad_actions_log: realized PAUSE actions (dry_run entries skipped)
 
-    BQ storage strategy:
-    - ad_campaign_daily: daily x per-campaign data (partitioned by segments.date)
-    - ad_keyword_performance: keyword snapshot at end_date (all campaigns)
-    - ad_actions_log: action log for PAUSE etc. (generated from paused_log)
-
-    Returns:
-        bool: True if all tables saved successfully, False if any failed.
+    Returns True iff every table saved successfully.
     """
-    if not SA_KEY_PATH.exists():
-        logger.warning("SA key file not found: %s. Skipping BQ save.", SA_KEY_PATH)
-        return False
-
-    try:
-        bq_client = bigquery.Client.from_service_account_json(str(SA_KEY_PATH))
-    except Exception as e:
-        logger.warning("Failed to initialize BigQuery client: %s", e)
+    bq_client = get_bq_client()
+    if bq_client is None:
         return False
 
     account_id = CUSTOMER_ID
     now_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    bq_save_ok = True
     ga_service = client.get_service("GoogleAdsService")
 
-    # ---------- ad_campaign_daily (all campaigns x daily) ----------
-    try:
-        table_camp = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_campaign_daily`"
-
-        # Idempotent DELETE (by period x account)
-        delete_camp_sql = f"""
-            DELETE FROM {table_camp}
-            WHERE date BETWEEN @start_date AND @end_date
-              AND account_id = @account_id
-        """
-        job_config_camp = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("start_date", "DATE", start_date),
-                bigquery.ScalarQueryParameter("end_date", "DATE", end_date),
-                bigquery.ScalarQueryParameter("account_id", "STRING", account_id),
-            ]
-        )
-        camp_delete_ok = True
-        try:
-            bq_client.query(delete_camp_sql, job_config=job_config_camp).result()
-        except BadRequest as e:
-            if "streaming buffer" in str(e):
-                logger.info("ad_campaign_daily: Skipping DELETE+INSERT due to streaming buffer")
-                camp_delete_ok = False
-            else:
-                raise
-
-        if camp_delete_ok:
-            # Fetch daily x all campaigns data from Google Ads API
-            # NOTE: Always pass through _validate_gaql_value() when using .format()
-            daily_query = BQ_DAILY_CAMPAIGN_QUERY.format(
-                start_date=_validate_gaql_value(start_date, "date"),
-                end_date=_validate_gaql_value(end_date, "date"),
-            )
-            response = ga_service.search(customer_id=CUSTOMER_ID, query=daily_query)
-
-            alert_count = len([a for a in alerts if a.get("level") in ("CRITICAL", "WARNING")])
-
-            rows_camp = []
-            for row in response:
-                rows_camp.append({
-                    "date": row.segments.date,
-                    "account_id": account_id,
-                    "campaign_id": str(row.campaign.id),
-                    "campaign_name": row.campaign.name,
-                    "impressions": row.metrics.impressions,
-                    "clicks": row.metrics.clicks,
-                    "ctr": row.metrics.ctr,
-                    "cost": row.metrics.cost_micros / 1_000_000,
-                    "conversions": row.metrics.conversions,
-                    "daily_budget": row.campaign_budget.amount_micros / 1_000_000,
-                    "campaign_status": row.campaign.status.name,
-                    "active_keywords": None,
-                    "paused_keywords": None,
-                    "alert_count": alert_count,
-                    "synced_at": now_ts,
-                })
-
-            if rows_camp:
-                bq_table_camp = bq_client.get_table(
-                    f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_campaign_daily"
-                )
-                for i in range(0, len(rows_camp), BQ_BATCH_SIZE):
-                    batch = rows_camp[i:i + BQ_BATCH_SIZE]
-                    errors = bq_client.insert_rows_json(bq_table_camp, batch)
-                    if errors:
-                        logger.warning(
-                            "ad_campaign_daily INSERT error (batch %d): %s",
-                            i // BQ_BATCH_SIZE + 1,
-                            errors,
-                        )
-                        bq_save_ok = False
-                print(f"[BQ] ad_campaign_daily: saved {len(rows_camp)} rows")
-            else:
-                print("[BQ] ad_campaign_daily: no data (skipped)")
-
-    except GoogleAdsException as ex:
-        logger.warning("ad_campaign_daily Google Ads API error: %s", ex)
-        bq_save_ok = False
-    except Exception as e:
-        logger.warning("Failed to save ad_campaign_daily: %s", e)
-        bq_save_ok = False
-
-    # ---------- ad_keyword_performance (all campaigns, previous day snapshot) ----------
-    # Google Ads API has incomplete data for current day, use previous day (end_date - 1)
-    kw_snapshot_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-    # If --days 1, ensure snapshot_date doesn't go before start_date
-    if kw_snapshot_date < start_date:
-        kw_snapshot_date = start_date
-    try:
-        table_kw = f"`{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_keyword_performance`"
-
-        # Idempotent DELETE (snapshot_date only)
-        delete_kw_sql = f"""
-            DELETE FROM {table_kw}
-            WHERE date = @date
-              AND account_id = @account_id
-        """
-        job_config_kw = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("date", "DATE", kw_snapshot_date),
-                bigquery.ScalarQueryParameter("account_id", "STRING", account_id),
-            ]
-        )
-        kw_delete_ok = True
-        try:
-            bq_client.query(delete_kw_sql, job_config=job_config_kw).result()
-        except BadRequest as e:
-            if "streaming buffer" in str(e):
-                logger.info("ad_keyword_performance: Skipping DELETE+INSERT due to streaming buffer")
-                kw_delete_ok = False
-            else:
-                raise
-
-        if not kw_delete_ok:
-            print("[BQ] ad_keyword_performance: streaming buffer active (next run will refresh)")
-        else:
-            # NOTE: Always pass through _validate_gaql_value() when using .format()
-            kw_query = BQ_DAILY_KEYWORD_QUERY.format(
-                date=_validate_gaql_value(kw_snapshot_date, "date"),
-            )
-            response = ga_service.search(customer_id=CUSTOMER_ID, query=kw_query)
-
-            rows_kw = []
-            for row in response:
-                qs = row.ad_group_criterion.quality_info.quality_score
-                rows_kw.append({
-                    "date": kw_snapshot_date,
-                    "account_id": account_id,
-                    "campaign_id": str(row.campaign.id),
-                    "campaign_name": row.campaign.name,
-                    "ad_group_id": str(row.ad_group.id),
-                    "ad_group_name": row.ad_group.name,
-                    "keyword_id": str(row.ad_group_criterion.criterion_id),
-                    "keyword_text": row.ad_group_criterion.keyword.text,
-                    "match_type": row.ad_group_criterion.keyword.match_type.name,
-                    "impressions": row.metrics.impressions,
-                    "clicks": row.metrics.clicks,
-                    "ctr": row.metrics.ctr,
-                    "cost_micros": row.metrics.cost_micros,
-                    "cost": row.metrics.cost_micros / 1_000_000,
-                    "conversions": row.metrics.conversions,
-                    "quality_score": qs if qs and qs > 0 else None,
-                    "avg_cpc_micros": int(row.metrics.average_cpc),
-                    "keyword_status": row.ad_group_criterion.status.name,
-                    "synced_at": now_ts,
-                })
-
-            if rows_kw:
-                bq_table_kw = bq_client.get_table(
-                    f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_keyword_performance"
-                )
-                for i in range(0, len(rows_kw), BQ_BATCH_SIZE):
-                    batch = rows_kw[i:i + BQ_BATCH_SIZE]
-                    errors = bq_client.insert_rows_json(bq_table_kw, batch)
-                    if errors:
-                        logger.warning(
-                            "ad_keyword_performance INSERT error (batch %d): %s",
-                            i // BQ_BATCH_SIZE + 1,
-                            errors,
-                        )
-                        bq_save_ok = False
-                print(f"[BQ] ad_keyword_performance: saved {len(rows_kw)} rows")
-            else:
-                print("[BQ] ad_keyword_performance: no data (skipped)")
-
-    except GoogleAdsException as ex:
-        logger.warning("ad_keyword_performance Google Ads API error: %s", ex)
-        bq_save_ok = False
-    except Exception as e:
-        logger.warning("Failed to save ad_keyword_performance: %s", e)
-        bq_save_ok = False
-
-    # ---------- ad_actions_log ----------
-    # INSERT only if dry_run=False and actual PAUSEs occurred
-    actual_pauses = [p for p in paused_log if not p.get("dry_run", True)]
-    if actual_pauses:
-        try:
-            rows_action = []
-            today_str = datetime.now(tz=JST).strftime("%Y-%m-%d")
-            for p in actual_pauses:
-                rows_action.append({
-                    "id": str(uuid.uuid4()),
-                    "date": today_str,
-                    "account_id": account_id,
-                    "action_type": "PAUSE",
-                    "target_type": "KEYWORD",
-                    "target_id": str(p.get("criterion_id", "")),
-                    "target_name": p.get("keyword_text", ""),
-                    "reason": p.get("reason", ""),
-                    "dry_run": False,
-                    "previous_status": "ENABLED",
-                    "created_at": now_ts,
-                })
-
-            bq_table_action = bq_client.get_table(
-                f"{BQ_PROJECT_ID}.{BQ_DATASET_ID}.ad_actions_log"
-            )
-            errors = bq_client.insert_rows_json(bq_table_action, rows_action)
-            if errors:
-                logger.warning("ad_actions_log INSERT error: %s", errors)
-                bq_save_ok = False
-            else:
-                print(f"[BQ] ad_actions_log: saved {len(rows_action)} rows")
-
-        except Exception as e:
-            logger.warning("Failed to save ad_actions_log: %s", e)
-            bq_save_ok = False
-
-    return bq_save_ok
+    ok_campaign = _save_campaign_daily(
+        bq_client, ga_service, start_date, end_date, account_id, alerts, now_ts,
+    )
+    ok_keyword = _save_keyword_performance(
+        bq_client, ga_service, start_date, end_date, account_id, now_ts,
+    )
+    ok_actions = _save_actions_log(bq_client, paused_log, account_id, now_ts)
+    return ok_campaign and ok_keyword and ok_actions
 
 
 # ===== Discord Notifications =====
@@ -1890,7 +1903,7 @@ def main():
 
     # Initialize Google Ads client
     try:
-        client = GoogleAdsClient.load_from_storage(str(YAML_PATH))
+        client = get_google_ads_client(YAML_PATH)
     except Exception as e:
         logger.error("Failed to initialize Google Ads client: %s", e)
         logger.error("  google-ads.yaml path: %s", YAML_PATH)
