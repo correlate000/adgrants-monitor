@@ -1981,6 +1981,34 @@ def main():
             discord=args.discord,
         )
 
+    # ----------------------------------------------------------------
+    # Monthly pace watch: Ad Grants deactivation is judged on MONTHLY CTR
+    # (below 5% for two consecutive months). Watch the judged unit itself
+    # daily, in addition to the 7-day rolling CTR. Ads API only = free.
+    # ----------------------------------------------------------------
+    try:
+        today_jst = datetime.now(tz=JST)
+        month_start_str = today_jst.replace(day=1).strftime("%Y-%m-%d")
+        today_str_jst = today_jst.strftime("%Y-%m-%d")
+        mtd = fetch_campaign_metrics(client, month_start_str, today_str_jst)
+        if mtd and mtd.get("impressions", 0) >= 1000 and today_jst.day >= 3:
+            mtd_ctr = mtd["ctr"]
+            if not args.json_only:
+                print(f"[INFO] Monthly pace: {today_jst.strftime('%Y-%m')} month-to-date CTR "
+                      f"{mtd_ctr * 100:.2f}% (imp {mtd['impressions']:,} / 5% required)")
+            if mtd_ctr < CTR_CRITICAL_THRESHOLD:
+                alerts.append({
+                    "level": "CRITICAL",
+                    "category": "monthly_pace",
+                    "message": (
+                        f"Month-to-date CTR ({month_start_str} to {today_str_jst}) is "
+                        f"{mtd_ctr * 100:.2f}%, below the 5% monthly requirement. "
+                        "Two consecutive months below 5% deactivates an Ad Grants account."
+                    ),
+                })
+    except Exception as e:  # noqa: BLE001 — pace watch must not stop the daily run
+        logger.warning("Monthly pace fetch failed: %s", e)
+
     # Generate recommendations
     suggestions = generate_keyword_suggestions(keywords)
 
