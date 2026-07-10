@@ -2053,6 +2053,33 @@ def main():
             alerts, paused_log,
         )
 
+    # ----------------------------------------------------------------
+    # Escalate consecutive BQ save failures to CRITICAL.
+    # A silent 2-week save outage (disabled service account) once went
+    # unnoticed; 3 consecutive failures now ride Discord + email.
+    # ----------------------------------------------------------------
+    if args.save_bq:
+        streak_file = REPORTS_DIR / ".bq_save_fail_streak"
+        try:
+            streak = int(streak_file.read_text(encoding="utf-8").strip()) if streak_file.exists() else 0
+        except (ValueError, OSError):
+            streak = 0
+        streak = 0 if bq_save_ok else streak + 1
+        try:
+            streak_file.write_text(str(streak), encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to write BQ failure counter: %s", e)
+        if streak >= 3:
+            alerts.append({
+                "level": "CRITICAL",
+                "category": "bq_save_outage",
+                "message": (
+                    f"BigQuery data save has failed {streak} days in a row. "
+                    "Typical cause: disabled service account or missing key. "
+                    "Analytics data is accumulating gaps (ad serving unaffected)."
+                ),
+            })
+
     # Discord notification
     if args.discord:
         # Send to ad alert channel if CRITICAL/WARNING alerts exist
