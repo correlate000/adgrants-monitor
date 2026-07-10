@@ -35,6 +35,7 @@ from google.cloud import bigquery
 from google.protobuf import field_mask_pb2
 
 from config import CAMPAIGN_NAME, CAMPAIGN_NAMES, CAMPAIGN_PAUSE_TYPE, CUSTOMER_ID
+from ads_common.email import send_alert_email
 from ads_common.gaql import validate_gaql_value
 
 logging.basicConfig(
@@ -57,9 +58,15 @@ CTR_KW_PAUSE_50IMP = 0.02       # ctr type: auto-pause if 50+ imp and CTR < 2%
 CTR_EARLY_WARNING_THRESHOLD = 0.06  # 6% -> early warning
 
 # Safety guards
-MAX_PAUSE_PER_RUN = 3           # Max 3 keywords paused per run
-MAX_PAUSE_PER_DAY = 5           # Max cumulative pauses per day
+MAX_PAUSE_PER_RUN = 5           # Standard quota: max pauses per run (excess carries over)
+MAX_PAUSE_PER_DAY = 5           # Standard quota: max cumulative pauses per day
 MIN_ENABLED_KEYWORDS = 5        # Minimum enabled keywords remaining after PAUSE
+# High-confidence pauses (enough impressions but near-zero CTR = shown but never
+# clicked) carry minimal misjudgment risk, so they are exempt from both count caps.
+# Without this, a backlog larger than the cap used to skip ALL pauses and the
+# auto-pause pipeline silently stalled.
+HIGH_CONFIDENCE_CTR_THRESHOLD = 0.001  # CTR < 0.1%
+HIGH_CONFIDENCE_MIN_IMP = 50           # imp >= 50
 
 # Auto-pause exclusion list (managed via JSON)
 # Do not edit directly - update pause_exclusion_list.json instead
@@ -845,88 +852,96 @@ def pause_keywords(
         except Exception as e:
             logger.debug("BQ PAUSE count retrieval failed (falling back to pause_log.json): %s", e)
 
-    # Daily cumulative limit check
-    if today_paused_count >= MAX_PAUSE_PER_DAY:
+    # ===== Selection: high-confidence exempt from caps; standard quota takes top-N =====
+    # The old design skipped ALL pauses when targets exceeded the per-run cap, so a
+    # backlog stalled the pipeline indefinitely. Now: process what fits, defer the rest.
+    high_confidence = [
+        t for t in pause_targets
+        if t["ctr"] < HIGH_CONFIDENCE_CTR_THRESHOLD
+        and t["impressions"] >= HIGH_CONFIDENCE_MIN_IMP
+    ]
+    high_conf_names = {t["resource_name"] for t in high_confidence}
+    standard = [t for t in pause_targets if t["resource_name"] not in high_conf_names]
+
+    # Remaining standard quota for today (per-day cap applies to standard only)
+    remaining_today = max(0, MAX_PAUSE_PER_DAY - today_paused_count)
+    standard_quota = min(MAX_PAUSE_PER_RUN, remaining_today)
+    standard_sorted = sorted(standard, key=lambda t: t["impressions"], reverse=True)
+    selected = high_confidence + standard_sorted[:standard_quota]
+    deferred = standard_sorted[standard_quota:]
+
+    if deferred:
         msg = (
-            f"Daily cumulative PAUSE count has reached the limit ({MAX_PAUSE_PER_DAY})."
-            f" Today: {today_paused_count}. Manual review required."
+            f"Of {len(pause_targets)} PAUSE targets, processing {len(high_confidence)} "
+            f"high-confidence (cap-exempt) + {min(standard_quota, len(standard_sorted))} "
+            f"standard (by imp desc) today; {len(deferred)} carried over to next runs."
         )
         logger.warning(msg)
         if discord:
             embed = build_ad_alert_embed(
-                title="[CRITICAL] PAUSE limit reached — manual review required",
+                title="[WARNING] PAUSE targets exceed cap — processing top-N, deferring rest",
                 description=msg,
-                severity="CRITICAL",
+                severity="WARNING",
                 fields={
-                    "Today's PAUSE count": str(today_paused_count),
-                    "Limit": str(MAX_PAUSE_PER_DAY),
+                    "Processed today": str(len(selected)),
+                    "High-confidence (cap-exempt)": str(len(high_confidence)),
+                    "Deferred": str(len(deferred)),
                     "Rollback": "`python monitor_ad_performance.py --undo`",
                 },
             )
             send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
-        return paused_log
 
-    # Per-run limit check
-    if len(pause_targets) > MAX_PAUSE_PER_RUN:
-        msg = (
-            f"PAUSE targets ({len(pause_targets)}) exceed per-run limit ({MAX_PAUSE_PER_RUN})."
-            " Manual review required."
+    if not selected:
+        logger.warning(
+            "No standard quota left today and no high-confidence targets; skipping PAUSE "
+            f"(today: {today_paused_count}/{MAX_PAUSE_PER_DAY}, "
+            f"{len(pause_targets)} targets carried over)."
         )
-        logger.warning(msg)
-        if discord:
-            embed = build_ad_alert_embed(
-                title="[CRITICAL] Too many PAUSE targets — manual review required",
-                description=msg,
-                severity="CRITICAL",
-                fields={
-                    "PAUSE target count": str(len(pause_targets)),
-                    "Per-run limit": str(MAX_PAUSE_PER_RUN),
-                    "Rollback": "`python monitor_ad_performance.py --undo`",
-                },
-            )
-            send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
         return paused_log
 
-    # Check enabled keyword count after PAUSE (per campaign)
+    # Check enabled keyword count after PAUSE (per campaign).
+    # Exclude only the violating campaigns' targets and continue (no full abort).
     enabled_by_campaign = Counter(
         kw["campaign_name"] for kw in all_keywords if kw["status"] == "ENABLED"
     )
     targets_by_campaign = Counter(
-        t["campaign_name"] for t in pause_targets
+        t["campaign_name"] for t in selected
     )
     blocked_campaigns = []
+    blocked_set: set[str] = set()
     for campaign, target_count in targets_by_campaign.items():
         remaining = enabled_by_campaign.get(campaign, 0) - target_count
         if remaining < MIN_ENABLED_KEYWORDS:
             blocked_campaigns.append(
                 f"{campaign}: enabled={enabled_by_campaign.get(campaign, 0)} -> remaining={remaining}"
             )
+            blocked_set.add(campaign)
     if blocked_campaigns:
         msg = (
-            f"Some campaigns would have fewer than {MIN_ENABLED_KEYWORDS} enabled KWs after PAUSE: "
+            f"Excluding campaigns that would drop below {MIN_ENABLED_KEYWORDS} enabled KWs: "
             + "; ".join(blocked_campaigns)
-            + ". Manual review required."
         )
         logger.warning(msg)
         if discord:
             embed = build_ad_alert_embed(
-                title="[CRITICAL] Insufficient enabled keywords per campaign",
+                title="[WARNING] Insufficient enabled keywords — excluding affected campaigns",
                 description=msg,
-                severity="CRITICAL",
+                severity="WARNING",
                 fields={
-                    "Affected campaigns": "\n".join(blocked_campaigns),
+                    "Excluded campaigns": "\n".join(blocked_campaigns),
                     "Minimum required/campaign": str(MIN_ENABLED_KEYWORDS),
-                    "Rollback": "`python monitor_ad_performance.py --undo`",
                 },
             )
             send_discord_notification(DISCORD_WEBHOOK_AD_ALERT, content="", embeds=[embed])
-        return paused_log
+        selected = [t for t in selected if t["campaign_name"] not in blocked_set]
+        if not selected:
+            return paused_log
 
     # ===== Execute PAUSE =====
     criterion_service = client.get_service("AdGroupCriterionService")
     operations = []
 
-    for kw in pause_targets:
+    for kw in selected:
         operation = client.get_type("AdGroupCriterionOperation")
         criterion = operation.update
         criterion.resource_name = kw["resource_name"]
@@ -943,7 +958,7 @@ def pause_keywords(
         )
         now_iso = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         new_entries = []
-        for kw in pause_targets:
+        for kw in selected:
             entry = {
                 "date": today_str,
                 "keyword_text": kw["keyword_text"],
@@ -983,7 +998,7 @@ def pause_keywords(
         for error in ex.failure.errors:
             logger.error("  - %s", error.message)
         if discord and DISCORD_WEBHOOK_AD_ALERT:
-            kw_names = ", ".join(t["keyword_text"] for t in pause_targets[:5])
+            kw_names = ", ".join(t["keyword_text"] for t in selected[:5])
             embed = build_ad_alert_embed(
                 title="[CRITICAL] PAUSE API failed — keywords NOT paused",
                 description=f"mutate_ad_group_criteria failed. Target KWs: {kw_names}",
@@ -1874,11 +1889,33 @@ def parse_args():
         action="store_true",
         help="Send weekly summary to Discord (auto-runs every Monday)",
     )
+    parser.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Disable email escalation on CRITICAL (default: one email per day)",
+    )
+    parser.add_argument(
+        "--test-email",
+        action="store_true",
+        help="Send one test alert email and exit",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # --test-email: verify the escalation path and exit
+    if args.test_email:
+        ok = send_alert_email(
+            subject="[AdGrants] Test email (escalation path check)",
+            body=(
+                "Test send from monitor_ad_performance.py --test-email.\n"
+                "If this arrived, CRITICAL email escalation is working."
+            ),
+        )
+        print("Test email: " + ("OK" if ok else "FAILED (check .env settings)"))
+        return
 
     # Set date range
     start_date, end_date = build_date_range(args.days)
@@ -2051,6 +2088,44 @@ def main():
                 content="",
                 embeds=[summary_embed],
             )
+
+    # ----------------------------------------------------------------
+    # CRITICAL email escalation (one per day; guards against missed Discord alerts)
+    # ----------------------------------------------------------------
+    critical_alerts = [a for a in alerts if a["level"] == "CRITICAL"]
+    if critical_alerts and not args.no_email and not args.json_only:
+        email_sentinel = REPORTS_DIR / ".last_critical_email"
+        today_mark = datetime.now(tz=JST).strftime("%Y-%m-%d")
+        already_sent = (
+            email_sentinel.exists()
+            and email_sentinel.read_text(encoding="utf-8").strip() == today_mark
+        )
+        if already_sent:
+            logger.info("CRITICAL email already sent today; skipping")
+        else:
+            ctr_str = f"{campaign['ctr'] * 100:.2f}%" if campaign else "-"
+            executed_pauses = len([p for p in paused_log if not p.get("dry_run")])
+            lines = [
+                f"CRITICAL detected by AdGrants monitor (period: {start_date} to {end_date})",
+                f"Account CTR: {ctr_str} (Ad Grants requirement: 5%+)",
+                "",
+                "== CRITICAL ==",
+            ]
+            lines += [f"- {a['message']}" for a in critical_alerts]
+            warn_alerts = [a for a in alerts if a["level"] == "WARNING"]
+            if warn_alerts:
+                lines += ["", f"== WARNING (top 5 of {len(warn_alerts)}) =="]
+                lines += [f"- {a['message']}" for a in warn_alerts[:5]]
+            lines += [
+                "",
+                f"Auto-pauses executed today: {executed_pauses}",
+                "This email is sent once per day when CRITICAL is detected.",
+            ]
+            if send_alert_email(
+                subject=f"[AdGrants] CRITICAL: account CTR {ctr_str} (5% required)",
+                body="\n".join(lines),
+            ):
+                email_sentinel.write_text(today_mark, encoding="utf-8")
 
     # ----------------------------------------------------------------
     # Weekly summary (auto-send every Monday)
