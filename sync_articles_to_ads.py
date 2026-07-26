@@ -131,29 +131,23 @@ def truncate_to_width(s: str, max_width: int) -> str:
 
 
 def send_discord(title: str, description: str, severity: str, fields: dict) -> None:
-    """Send notification to Discord Webhook (skipped if httpx is not available)"""
-    if not DISCORD_WEBHOOK or not HTTPX_AVAILABLE:
+    """Send notification via the ISVD /api/alert endpoint (CRON_SECRET auth -> email).
+    Formerly a Discord webhook; switched to email on 2026-07-26. Name kept for caller compatibility."""
+    secret = os.environ.get("CRON_SECRET", "")
+    if not secret or not HTTPX_AVAILABLE:
         return
-    from datetime import datetime, timezone, timedelta
-    color_map = {
-        "CRITICAL": 15158332,
-        "WARNING": 15105826,
-        "INFO": 3447003,
-        "SUCCESS": 3066993,
-    }
-    now_utc = datetime.now(tz=timezone.utc)
-    embed = {
-        "title": title,
-        "description": description,
-        "color": color_map.get(severity, color_map["INFO"]),
-        "fields": [{"name": k, "value": v, "inline": True} for k, v in fields.items()],
-        "footer": {"text": "Ad Grants Sync | sync_articles_to_ads.py"},
-        "timestamp": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
+    body = "\n".join([description, ""] + [f"{k}: {v}" for k, v in fields.items()])
     try:
-        httpx.post(DISCORD_WEBHOOK, json={"content": "", "embeds": [embed]}, timeout=10)
+        resp = httpx.post(
+            "https://isvd.or.jp/api/alert",
+            headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"},
+            json={"feature": "ads-sync", "reason": f"[{severity}] {title}\n{body}"},
+            timeout=10,
+        )
+        if resp.status_code >= 400:
+            print(f"  [WARN] email notification failed: HTTP {resp.status_code}", file=sys.stderr)
     except Exception as e:
-        print(f"  [WARN] Discord notification failed: {e}", file=sys.stderr)
+        print(f"  [WARN] email notification failed: {e}", file=sys.stderr)
 
 
 # ===========================================================================
