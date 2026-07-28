@@ -97,6 +97,11 @@ CTR_EARLY_WARNING_THRESHOLD = 0.06  # 6% -> early warning
 # Safety guards
 MAX_PAUSE_PER_RUN = 5           # Standard quota: max pauses per run (excess carries over)
 MAX_PAUSE_PER_DAY = 5           # Standard quota: max cumulative pauses per day
+# Strict mode quota (no click budget = on pace to miss the monthly 5%), added 2026-07-28.
+# At 5 per day the backlog cannot be cleared before month end. A real run on
+# 2026-07-28 19:00 processed only 2 of 35 targets and deferred 33.
+MAX_PAUSE_PER_RUN_STRICT = 20
+MAX_PAUSE_PER_DAY_STRICT = 20
 MIN_ENABLED_KEYWORDS = 5        # Minimum enabled keywords remaining after PAUSE
 # High-confidence pauses (enough impressions but near-zero CTR = shown but never
 # clicked) carry minimal misjudgment risk, so they are exempt from both count caps.
@@ -819,7 +824,11 @@ def generate_alerts(
 
 # ===== Auto-Pause =====
 
-def identify_pause_targets(keywords: list[dict], headroom: dict | None = None) -> list[dict]:
+def identify_pause_targets(
+    keywords: list[dict],
+    headroom: dict | None = None,
+    ad_groups: list[dict] | None = None,
+) -> list[dict]:
     """Identify keywords subject to auto-pause.
 
     Per-campaign pause criteria delegated to is_pause_target().
@@ -833,9 +842,19 @@ def identify_pause_targets(keywords: list[dict], headroom: dict | None = None) -
     """
     strict = bool(headroom) and headroom.get("measurable") and headroom["budget_clicks"] <= 0
 
+    # Keywords inside a paused ad group never serve, so pausing them moves CTR by
+    # exactly zero -- yet they still consume the daily pause quota. In a real run on
+    # 2026-07-28, 24 of 35 targets were of this kind and crowded out the 11 that mattered.
+    paused_ag = {
+        ag["ad_group_name"] for ag in (ad_groups or [])
+        if ag.get("status") != "ENABLED"
+    }
+
     targets = []
     for kw in keywords:
         if kw["status"] == "PAUSED":
+            continue
+        if kw.get("ad_group_name") in paused_ag:
             continue
 
         kw_text = kw.get("keyword_text", "")
@@ -866,6 +885,7 @@ def pause_keywords(
     all_keywords: list[dict],
     dry_run: bool,
     discord: bool = False,
+    strict: bool = False,
 ) -> list[dict]:
     """Pause target keywords. If dry_run=True, no actual pause is performed.
 
@@ -873,6 +893,9 @@ def pause_keywords(
     - Skip if daily cumulative PAUSE count reaches MAX_PAUSE_PER_DAY
     - Skip if PAUSE targets exceed MAX_PAUSE_PER_RUN (prompt manual review)
     - Skip if enabled keywords would drop below MIN_ENABLED_KEYWORDS after PAUSE
+
+    strict=True (no click budget = on pace to miss the monthly 5%) raises the
+    quotas, because 5 per day cannot clear the backlog before month end.
     """
     paused_log = []
 
@@ -925,8 +948,10 @@ def pause_keywords(
     standard = [t for t in pause_targets if t["resource_name"] not in high_conf_names]
 
     # Remaining standard quota for today (per-day cap applies to standard only)
-    remaining_today = max(0, MAX_PAUSE_PER_DAY - today_paused_count)
-    standard_quota = min(MAX_PAUSE_PER_RUN, remaining_today)
+    per_day = MAX_PAUSE_PER_DAY_STRICT if strict else MAX_PAUSE_PER_DAY
+    per_run = MAX_PAUSE_PER_RUN_STRICT if strict else MAX_PAUSE_PER_RUN
+    remaining_today = max(0, per_day - today_paused_count)
+    standard_quota = min(per_run, remaining_today)
     standard_sorted = sorted(standard, key=lambda t: t["impressions"], reverse=True)
     selected = high_confidence + standard_sorted[:standard_quota]
     deferred = standard_sorted[standard_quota:]
@@ -2481,7 +2506,10 @@ def main():
     # Auto-pause processing
     paused_log: list[dict] = []
     if args.auto_pause:
-        pause_targets = identify_pause_targets(keywords, headroom=headroom)
+        kw_strict = headroom.get("measurable") and headroom["budget_clicks"] <= 0
+        pause_targets = identify_pause_targets(
+            keywords, headroom=headroom, ad_groups=ad_groups,
+        )
         if not args.json_only and pause_targets:
             action_label = "[DRY-RUN] " if args.dry_run else ""
             print(
@@ -2493,6 +2521,7 @@ def main():
             all_keywords=keywords,
             dry_run=args.dry_run,
             discord=args.discord,
+            strict=kw_strict,
         )
 
         # ---- Ad-group level auto-pause (added 2026-07-28) ----
