@@ -87,6 +87,11 @@ LONGTAIL_RESUME_MAX_PER_RUN = 10  # Resume cap per run
 CV_PAUSE_MIN_CLICKS = 20        # cv type: pause if click >= 20 and CV < 0.5
 CTR_KW_PAUSE_100IMP = 0.03      # ctr type: auto-pause if 100+ imp and CTR < 3%
 CTR_KW_PAUSE_50IMP = 0.02       # ctr type: auto-pause if 50+ imp and CTR < 2%
+# Strict line used when there is no click budget (added 2026-07-28).
+# The thresholds above never touch the 3-5% band, so keywords sitting there kept
+# serving even inside ad groups that were above 5% overall -- 33% of live impressions.
+KW_STRICT_PAUSE_CTR = 0.05      # The requirement itself
+KW_STRICT_PAUSE_MIN_IMP = 30    # Keep the eligibility floor small
 CTR_EARLY_WARNING_THRESHOLD = 0.06  # 6% -> early warning
 
 # Safety guards
@@ -814,12 +819,20 @@ def generate_alerts(
 
 # ===== Auto-Pause =====
 
-def identify_pause_targets(keywords: list[dict]) -> list[dict]:
+def identify_pause_targets(keywords: list[dict], headroom: dict | None = None) -> list[dict]:
     """Identify keywords subject to auto-pause.
 
     Per-campaign pause criteria delegated to is_pause_target().
     Strategy types centrally managed in config.CAMPAIGN_PAUSE_TYPE.
+
+    Added 2026-07-28: with no click budget left, raise the pause line to the
+    requirement itself (5%). The legacy thresholds (3% at 100 imp / 2% at 50 imp)
+    let the 3-5% band through entirely, so keywords there kept serving even inside
+    ad groups that were above 5% overall -- 33% of live impressions in one account.
+    While there is budget the legacy thresholds apply and the long tail keeps running.
     """
+    strict = bool(headroom) and headroom.get("measurable") and headroom["budget_clicks"] <= 0
+
     targets = []
     for kw in keywords:
         if kw["status"] == "PAUSED":
@@ -832,6 +845,15 @@ def identify_pause_targets(keywords: list[dict]) -> list[dict]:
             continue
 
         is_target, reason = is_pause_target(kw)
+        if not is_target and strict:
+            imp = kw.get("impressions", 0)
+            ctr = kw.get("ctr", 0.0)
+            if imp >= KW_STRICT_PAUSE_MIN_IMP and ctr < KW_STRICT_PAUSE_CTR:
+                is_target = True
+                reason = (
+                    f"strict mode (no budget): {imp} impressions at CTR {ctr*100:.2f}% "
+                    f"(< {KW_STRICT_PAUSE_CTR:.0%})"
+                )
         if is_target and reason:
             targets.append({**kw, "pause_reason": reason})
 
@@ -2459,7 +2481,7 @@ def main():
     # Auto-pause processing
     paused_log: list[dict] = []
     if args.auto_pause:
-        pause_targets = identify_pause_targets(keywords)
+        pause_targets = identify_pause_targets(keywords, headroom=headroom)
         if not args.json_only and pause_targets:
             action_label = "[DRY-RUN] " if args.dry_run else ""
             print(
