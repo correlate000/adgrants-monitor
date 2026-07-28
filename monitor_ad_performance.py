@@ -48,8 +48,40 @@ logger = logging.getLogger(__name__)
 # Ad Grants CTR thresholds
 CTR_CRITICAL_THRESHOLD = 0.05   # 5% or below -> CRITICAL (risk of suspension)
 CTR_WARNING_THRESHOLD = 0.07    # 7% or below -> WARNING (approaching danger zone)
-CTR_AD_GROUP_MIN = 0.05         # Per ad group: WARNING if < 5%
+CTR_AD_GROUP_MIN = 0.05         # Per ad group: alert if < 5%
 QS_MIN = 3                      # Ad Grants minimum quality score
+
+# Ad-group level auto-pause (added 2026-07-28)
+# Background: a low-CTR ad group used to raise a WARNING only, and was never paused --
+# auto-pause covered keywords alone. Worse, e-mail escalation only fires on CRITICAL,
+# so those WARNINGs reached nobody. One ad group sat at 2.15-4.37% CTR for 11 days
+# before degrading to 1.47% and putting the whole account at risk. Close the loop here.
+AG_PAUSE_MIN_IMP = 30           # Minimum impressions to judge (keep this floor small)
+AG_PAUSE_MAX_PER_RUN = 10       # Blast-radius cap for unattended runs; rest is deferred
+AG_MIN_ENABLED = 20             # Never pause below this many enabled ad groups
+AG_ALERT_CRITICAL_MIN_IMP = 100  # 5% breach at this volume is CRITICAL (i.e. e-mailed)
+
+# Impression surge detection (added 2026-07-28)
+# Compare against the previous run's report JSON to catch an ad group whose
+# impressions explode while CTR collapses, within the same day.
+AG_SURGE_RATIO = 2.0            # Impressions grew at least this many times
+AG_SURGE_MIN_IMP = 200          # ...and reached at least this absolute volume
+
+# Long-tail operation (added 2026-07-28)
+# "If the monthly 5% has room to spare, keep running the low-CTR long-tail articles."
+# Treat the amount by which month-to-date beats the target as a click budget, and
+# spend it on low-CTR delivery. No budget -> strict pausing, as before.
+#
+#   surplus clicks = MTD clicks - target CTR * MTD impressions
+#   cost of keeping an ad group = days left * daily impressions * (target CTR - its CTR)
+#
+# Cheapest (i.e. highest CTR) ad groups are kept first, so a month with more room
+# automatically runs a wider long tail, and a tight month tightens itself.
+LONGTAIL_TARGET_CTR = 0.053      # Month-end goal (5% requirement + 0.3pt safety margin)
+LONGTAIL_BUDGET_USE_RATIO = 0.6  # Share of surplus spent on long tail (rest is reserve)
+LONGTAIL_MIN_MTD_IMP = 5000      # Below this MTD volume the budget is not measurable
+LONGTAIL_RESUME_MARGIN = 1.5     # Resume only with 1.5x the cost in budget (anti-flapping)
+LONGTAIL_RESUME_MAX_PER_RUN = 10  # Resume cap per run
 
 # Per-campaign PAUSE criteria (type definitions in config.CAMPAIGN_PAUSE_TYPE)
 CV_PAUSE_MIN_CLICKS = 20        # cv type: pause if click >= 20 and CV < 0.5
@@ -116,6 +148,7 @@ AD_GROUP_QUERY = """
     SELECT
         ad_group.id,
         ad_group.name,
+        ad_group.resource_name,
         ad_group.status,
         campaign.name,
         metrics.impressions,
@@ -560,6 +593,7 @@ def fetch_ad_group_metrics(client, start_date: str, end_date: str) -> list[dict]
             groups[gid] = {
                 "ad_group_id": gid,
                 "ad_group_name": ag.name,
+                "resource_name": ag.resource_name,
                 "campaign_name": row.campaign.name,
                 "status": ag.status.name,
                 "impressions": 0,
@@ -739,16 +773,21 @@ def generate_alerts(
         })
 
     # Ad group CTR check
+    # 2026-07-28: a 5% breach at meaningful volume is escalated to CRITICAL.
+    # As WARNING it stayed out of e-mail escalation and reached nobody for 11 days.
     for ag in ad_groups:
         if ag["impressions"] < 10:
             continue  # Skip if insufficient impressions
+        if ag["status"] != "ENABLED":
+            continue  # Already paused; ignore the residue in the window
         if ag["ctr"] < CTR_AD_GROUP_MIN:
+            material = ag["impressions"] >= AG_ALERT_CRITICAL_MIN_IMP
             alerts.append({
-                "level": "WARNING",
+                "level": "CRITICAL" if material else "WARNING",
                 "category": "ad_group_ctr",
                 "message": (
                     f"Ad group '{ag['ad_group_name']}' CTR is"
-                    f" {format_ctr_raw(ag['ctr'])} (< 5%)"
+                    f" {format_ctr_raw(ag['ctr'])} (< 5%, {ag['impressions']:,} impressions)"
                 ),
                 "ad_group_name": ag["ad_group_name"],
             })
@@ -1349,14 +1388,22 @@ def save_to_bigquery(
             rows_action = []
             today_str = datetime.now(tz=JST).strftime("%Y-%m-%d")
             for p in actual_pauses:
+                # 2026-07-28: ad-group level pauses land in the same table
+                target_type = p.get("target_type", "KEYWORD")
+                if target_type == "AD_GROUP":
+                    target_id = str(p.get("ad_group_id", ""))
+                    target_name = f"{p.get('ad_group_name', '')} @ {p.get('campaign_name', '')}"
+                else:
+                    target_id = str(p.get("criterion_id", ""))
+                    target_name = p.get("keyword_text", "")
                 rows_action.append({
                     "id": str(uuid.uuid4()),
                     "date": today_str,
                     "account_id": account_id,
                     "action_type": "PAUSE",
-                    "target_type": "KEYWORD",
-                    "target_id": str(p.get("criterion_id", "")),
-                    "target_name": p.get("keyword_text", ""),
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "target_name": target_name,
                     "reason": p.get("reason", ""),
                     "dry_run": False,
                     "previous_status": "ENABLED",
@@ -1569,9 +1616,20 @@ def print_report(
     if not paused_log:
         print("  No pauses [OK]")
     else:
+        # 2026-07-28: ad-group pauses are mixed in, so render by target type
         for p in paused_log:
             dry_label = "[DRY-RUN] " if p.get("dry_run") else ""
-            print(f"  [PAUSED] {dry_label}'{p['keyword_text']}' ({p['ad_group_name']}) -- {p['reason']}")
+            reason = p.get("reason", "")
+            if p.get("target_type") == "AD_GROUP":
+                print(
+                    f"  [PAUSED] {dry_label}[ad group] '{p.get('ad_group_name', '')}'"
+                    f" ({p.get('campaign_name', '')}) -- {reason}"
+                )
+            else:
+                print(
+                    f"  [PAUSED] {dry_label}[keyword] '{p.get('keyword_text', '')}'"
+                    f" ({p.get('ad_group_name', '')}) -- {reason}"
+                )
 
     # --- Recommended actions ---
     section("Recommended Actions")
@@ -1658,8 +1716,410 @@ def build_json_report(
             "kw_pause_at_100imp": CTR_KW_PAUSE_100IMP,
             "kw_pause_at_50imp": CTR_KW_PAUSE_50IMP,
             "quality_score_min": QS_MIN,
+            # Ad-group auto-pause and long-tail operation (added 2026-07-28)
+            "ad_group_pause_min_imp": AG_PAUSE_MIN_IMP,
+            "ad_group_pause_max_per_run": AG_PAUSE_MAX_PER_RUN,
+            "ad_group_min_enabled": AG_MIN_ENABLED,
+            "longtail_target_ctr": LONGTAIL_TARGET_CTR,
+            "longtail_budget_use_ratio": LONGTAIL_BUDGET_USE_RATIO,
+            "longtail_min_mtd_imp": LONGTAIL_MIN_MTD_IMP,
         },
     }
+
+
+# ===== Ad-group level auto-pause and long-tail operation (added 2026-07-28) =====
+#
+# Auto-pause used to cover keywords only (target_type="KEYWORD"), so a low-CTR ad group
+# kept serving impressions no matter how often it was detected. This closes the gap:
+# detect -> pause, and, when the month has room to spare, keep (or resume) the long tail.
+
+AG_PAUSE_EXCLUSION_PATH = SCRIPT_DIR / "ag_pause_exclusion.json"
+AG_PAUSE_LOG_PATH = SCRIPT_DIR / "ag_pause_log.json"
+
+
+def load_ag_pause_exclusion() -> dict[str, str]:
+    """Ad-group level pause exclusion list ({ad_group_name: reason}). Empty if absent."""
+    if not AG_PAUSE_EXCLUSION_PATH.exists():
+        return {}
+    try:
+        with open(AG_PAUSE_EXCLUSION_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {e["ad_group_name"]: e.get("reason", "") for e in data.get("entries", [])}
+    except Exception as e:  # noqa: BLE001 -- a broken exclusion list must not stop monitoring
+        logger.warning("Failed to load ad group exclusion list: %s", e)
+        return {}
+
+
+def days_left_in_month(now: datetime | None = None) -> float:
+    """Days remaining in the calendar month (fractional); the judged unit is the month."""
+    now = now or datetime.now(tz=JST)
+    if now.month == 12:
+        next_month = now.replace(year=now.year + 1, month=1, day=1,
+                                 hour=0, minute=0, second=0, microsecond=0)
+    else:
+        next_month = now.replace(month=now.month + 1, day=1,
+                                 hour=0, minute=0, second=0, microsecond=0)
+    return max(0.0, (next_month - now).total_seconds() / 86400)
+
+
+def compute_ctr_headroom(mtd: dict | None, now: datetime | None = None) -> dict:
+    """Derive the click budget available for low-CTR delivery from month-to-date results.
+
+    surplus clicks = MTD clicks - target CTR * MTD impressions.
+    A positive surplus is savings built up above the target; part of it funds the long tail.
+    """
+    imp = (mtd or {}).get("impressions", 0)
+    clicks = (mtd or {}).get("clicks", 0)
+    surplus = clicks - LONGTAIL_TARGET_CTR * imp
+    measurable = imp >= LONGTAIL_MIN_MTD_IMP
+    return {
+        "mtd_impressions": imp,
+        "mtd_clicks": clicks,
+        "mtd_ctr": (clicks / imp) if imp else 0.0,
+        "surplus_clicks": surplus,
+        # No surplus, or not enough volume to judge -> zero budget -> strict pausing
+        "budget_clicks": max(0.0, surplus * LONGTAIL_BUDGET_USE_RATIO) if measurable else 0.0,
+        "measurable": measurable,
+        "days_left": days_left_in_month(now),
+        "target_ctr": LONGTAIL_TARGET_CTR,
+    }
+
+
+def estimate_longtail_cost(ag: dict, headroom: dict, window_days: int) -> float:
+    """Clicks this ad group would cost (versus target) if kept running until month end."""
+    if window_days <= 0:
+        return 0.0
+    daily_imp = ag["impressions"] / window_days
+    gap = max(0.0, headroom["target_ctr"] - ag["ctr"])
+    return daily_imp * headroom["days_left"] * gap
+
+
+def identify_ad_group_pause_targets(
+    ad_groups: list[dict],
+    headroom: dict | None = None,
+    window_days: int = 7,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split ad groups into pause / defer / keep-as-long-tail.
+
+    Criteria: ENABLED, impressions >= AG_PAUSE_MIN_IMP, CTR < CTR_AD_GROUP_MIN.
+    Candidates affordable within the click budget are kept. The eligibility floor is
+    deliberately small: a large floor lets borderline offenders slip through every time.
+    """
+    exclusion = load_ag_pause_exclusion()
+    enabled = [ag for ag in ad_groups if ag.get("status") == "ENABLED"]
+
+    candidates = [
+        ag for ag in enabled
+        if ag["impressions"] >= AG_PAUSE_MIN_IMP
+        and ag["ctr"] < CTR_AD_GROUP_MIN
+        and ag["ad_group_name"] not in exclusion
+    ]
+
+    # Spend the budget cheapest-first (i.e. highest CTR first)
+    kept: list[dict] = []
+    to_pause: list[dict] = []
+    if headroom and headroom["budget_clicks"] > 0:
+        remaining = headroom["budget_clicks"]
+        for ag in sorted(candidates, key=lambda a: -a["ctr"]):
+            cost = estimate_longtail_cost(ag, headroom, window_days)
+            if cost <= remaining:
+                remaining -= cost
+                kept.append(dict(ag, longtail_cost=round(cost, 1)))
+            else:
+                to_pause.append(ag)
+    else:
+        to_pause = list(candidates)
+
+    # Handle the biggest bleeders first
+    to_pause.sort(key=lambda a: -a["impressions"])
+
+    # Never strand the account: keep at least AG_MIN_ENABLED ad groups running
+    allowed_by_floor = max(0, len(enabled) - AG_MIN_ENABLED)
+    limit = min(AG_PAUSE_MAX_PER_RUN, allowed_by_floor)
+
+    return to_pause[:limit], to_pause[limit:], kept
+
+
+def pause_ad_groups(client, targets: list[dict], dry_run: bool = False) -> list[dict]:
+    """Pause ad groups. The undo record is written before anything is mutated."""
+    if not targets:
+        return []
+
+    if dry_run:
+        for ag in targets:
+            logger.info(
+                "[DRY-RUN] ad group pause target: %s (impressions %s / CTR %s)",
+                ag["ad_group_name"], f"{ag['impressions']:,}", format_ctr_raw(ag["ctr"]),
+            )
+        return [dict(ag, dry_run=True) for ag in targets]
+
+    now_iso = datetime.now(tz=JST).isoformat()
+
+    # 1) Persist the undo record BEFORE mutating
+    history = []
+    if AG_PAUSE_LOG_PATH.exists():
+        try:
+            with open(AG_PAUSE_LOG_PATH, encoding="utf-8") as f:
+                history = json.load(f).get("entries", [])
+        except Exception as e:  # noqa: BLE001 -- a broken history must not block this pause
+            logger.warning("Failed to read ad group pause log (recreating): %s", e)
+    history.extend([
+        {
+            "paused_at": now_iso,
+            "ad_group_id": ag["ad_group_id"],
+            "ad_group_name": ag["ad_group_name"],
+            "campaign_name": ag["campaign_name"],
+            "resource_name": ag["resource_name"],
+            "impressions_7d": ag["impressions"],
+            "clicks_7d": ag["clicks"],
+            "ctr_7d": round(ag["ctr"], 5),
+            "previous_status": "ENABLED",
+        }
+        for ag in targets
+    ])
+    with open(AG_PAUSE_LOG_PATH, "w", encoding="utf-8") as f:
+        json.dump({"entries": history}, f, ensure_ascii=False, indent=2)
+
+    # 2) Mutate
+    ag_service = client.get_service("AdGroupService")
+    ops = []
+    for ag in targets:
+        op = client.get_type("AdGroupOperation")
+        op.update.resource_name = ag["resource_name"]
+        op.update.status = client.enums.AdGroupStatusEnum.PAUSED
+        op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["status"]))
+        ops.append(op)
+
+    try:
+        resp = ag_service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=ops)
+        logger.info("Paused ad groups: %d", len(resp.results))
+    except GoogleAdsException as e:
+        names = ", ".join(ag["ad_group_name"] for ag in targets[:5])
+        logger.error("Failed to pause ad groups: %s", e)
+        send_alert_email(
+            subject="[AdGrants] CRITICAL: ad group pause failed (nothing was paused)",
+            body=(
+                f"mutate_ad_groups failed for {len(targets)} target(s), first 5: {names}\n"
+                f"Error: {e}\n"
+                "Low-CTR ad groups are still serving. Pause them in the UI."
+            ),
+        )
+        return []
+
+    # 3) Verify from live data that they really are paused
+    rn_list = ", ".join(f"'{ag['resource_name']}'" for ag in targets)
+    verify_query = (
+        "SELECT ad_group.resource_name, ad_group.status "
+        f"FROM ad_group WHERE ad_group.resource_name IN ({rn_list})"
+    )
+    try:
+        svc = client.get_service("GoogleAdsService")
+        statuses = {
+            r.ad_group.resource_name: r.ad_group.status.name
+            for r in svc.search(customer_id=CUSTOMER_ID, query=verify_query)
+        }
+        not_paused = [
+            ag["ad_group_name"] for ag in targets
+            if statuses.get(ag["resource_name"]) != "PAUSED"
+        ]
+        if not_paused:
+            logger.error("verify: %d ad group(s) not paused: %s", len(not_paused), not_paused[:5])
+            send_alert_email(
+                subject="[AdGrants] CRITICAL: ad group pause verification failed",
+                body=(
+                    f"{len(not_paused)} ad group(s) are not PAUSED after the mutate:\n"
+                    + "\n".join(f"- {n}" for n in not_paused[:10])
+                ),
+            )
+        else:
+            logger.info("verify: all %d ad group(s) confirmed paused", len(targets))
+    except Exception as e:  # noqa: BLE001 -- verification failure must not lose the record
+        logger.warning("Failed to verify ad group pause: %s", e)
+
+    return [dict(ag, dry_run=False) for ag in targets]
+
+
+def identify_ad_group_resume_targets(
+    ad_groups: list[dict],
+    headroom: dict,
+    window_days: int,
+    already_spent: float,
+) -> list[dict]:
+    """Pick auto-paused ad groups to resume while the click budget allows it.
+
+    Only ad groups recorded in ag_pause_log.json are eligible -- manual pauses and
+    the exclusion list are never touched. Resuming requires LONGTAIL_RESUME_MARGIN
+    times the cost in budget so groups do not flap between paused and enabled.
+    """
+    if not headroom.get("measurable") or headroom["budget_clicks"] <= already_spent:
+        return []
+    if not AG_PAUSE_LOG_PATH.exists():
+        return []
+    try:
+        with open(AG_PAUSE_LOG_PATH, encoding="utf-8") as f:
+            entries = json.load(f).get("entries", [])
+    except Exception as e:  # noqa: BLE001 -- a broken record must not stop monitoring
+        logger.warning("Failed to read ad group pause log: %s", e)
+        return []
+
+    exclusion = load_ag_pause_exclusion()
+    # resource_name was added to the query on 2026-07-28; tolerate older shapes
+    current = {ag["resource_name"]: ag for ag in ad_groups if ag.get("resource_name")}
+
+    candidates: list[dict] = []
+    for e in entries:
+        rn = e.get("resource_name")
+        name = e.get("ad_group_name")
+        if not rn or not name or name in exclusion:
+            continue
+        ag = current.get(rn)
+        if not ag or ag.get("status") != "PAUSED":
+            continue  # Already running, or outside the current scope
+        # Long-paused groups have no impressions left in the trailing window,
+        # so fall back to the performance recorded at pause time
+        if ag["impressions"] > 0:
+            basis = ag
+        elif e.get("impressions_7d", 0) > 0:
+            basis = {
+                **ag,
+                "impressions": e["impressions_7d"],
+                "clicks": e.get("clicks_7d", 0),
+                "ctr": e.get("ctr_7d", 0.0),
+            }
+        else:
+            continue  # No data at all -- cost cannot be estimated
+        candidates.append(basis)
+
+    remaining = headroom["budget_clicks"] - already_spent
+    resume: list[dict] = []
+    # Cheapest (highest CTR) first
+    for ag in sorted(candidates, key=lambda a: -a["ctr"]):
+        cost = estimate_longtail_cost(ag, headroom, window_days)
+        if cost <= 0:
+            continue
+        if cost * LONGTAIL_RESUME_MARGIN <= remaining:
+            remaining -= cost
+            resume.append(dict(ag, longtail_cost=round(cost, 1)))
+        if len(resume) >= LONGTAIL_RESUME_MAX_PER_RUN:
+            break
+    return resume
+
+
+def resume_ad_groups(client, targets: list[dict], dry_run: bool = False) -> list[dict]:
+    """Resume ad groups (PAUSED -> ENABLED) within the click budget."""
+    if not targets:
+        return []
+
+    if dry_run:
+        for ag in targets:
+            logger.info(
+                "[DRY-RUN] ad group resume target: %s (impressions %s / CTR %s / cost %.1f clicks)",
+                ag["ad_group_name"], f"{ag['impressions']:,}",
+                format_ctr_raw(ag["ctr"]), ag.get("longtail_cost", 0),
+            )
+        return [dict(ag, dry_run=True) for ag in targets]
+
+    ag_service = client.get_service("AdGroupService")
+    ops = []
+    for ag in targets:
+        op = client.get_type("AdGroupOperation")
+        op.update.resource_name = ag["resource_name"]
+        op.update.status = client.enums.AdGroupStatusEnum.ENABLED
+        op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["status"]))
+        ops.append(op)
+
+    try:
+        resp = ag_service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=ops)
+        logger.info("Resumed ad groups: %d", len(resp.results))
+    except GoogleAdsException as e:
+        names = ", ".join(ag["ad_group_name"] for ag in targets[:5])
+        logger.error("Failed to resume ad groups: %s", e)
+        send_alert_email(
+            subject="[AdGrants] ad group resume failed",
+            body=(
+                f"mutate_ad_groups (resume) failed for {len(targets)} target(s), first 5: {names}\n"
+                f"Error: {e}\n"
+                "They stay paused, so CTR is unaffected, but the long tail is not running."
+            ),
+        )
+        return []
+
+    # Drop resumed entries from the pause log so they are not picked up again
+    try:
+        with open(AG_PAUSE_LOG_PATH, encoding="utf-8") as f:
+            entries = json.load(f).get("entries", [])
+        resumed_rn = {ag["resource_name"] for ag in targets}
+        kept_entries = [e for e in entries if e.get("resource_name") not in resumed_rn]
+        with open(AG_PAUSE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"entries": kept_entries}, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001 -- bookkeeping failure does not undo the resume
+        logger.warning("Failed to update ad group pause log: %s", e)
+
+    return [dict(ag, dry_run=False) for ag in targets]
+
+
+def load_previous_ad_group_snapshot() -> dict[str, dict]:
+    """Read per-ad-group figures from the most recent report JSON ({name: {imp, clicks}}).
+
+    Reports are saved at the end of main(), so at startup this is the previous run.
+    With two runs a day, the evening run compares against the same morning.
+    """
+    if not REPORTS_DIR.exists():
+        return {}
+    files = sorted(REPORTS_DIR.glob("ads-performance-*.json"))
+    if not files:
+        return {}
+    try:
+        with open(files[-1], encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:  # noqa: BLE001 -- a broken report must not stop monitoring
+        logger.warning("Failed to read previous report: %s", e)
+        return {}
+    snapshot: dict[str, dict] = {}
+    for ag in data.get("ad_groups", []):
+        name = ag.get("ad_group_name")
+        if not name:
+            continue
+        e = snapshot.setdefault(name, {"impressions": 0, "clicks": 0})
+        e["impressions"] += ag.get("impressions", 0)
+        e["clicks"] += ag.get("clicks", 0)
+    return snapshot
+
+
+def detect_impression_surge(ad_groups: list[dict]) -> list[dict]:
+    """Detect ad groups whose impressions exploded while CTR collapsed."""
+    prev = load_previous_ad_group_snapshot()
+    if not prev:
+        return []
+
+    current: dict[str, dict] = {}
+    for ag in ad_groups:
+        if ag.get("status") != "ENABLED":
+            continue
+        e = current.setdefault(ag["ad_group_name"], {"impressions": 0, "clicks": 0})
+        e["impressions"] += ag["impressions"]
+        e["clicks"] += ag["clicks"]
+
+    surges = []
+    for name, cur in current.items():
+        before = prev.get(name, {}).get("impressions", 0)
+        now_imp = cur["impressions"]
+        if now_imp < AG_SURGE_MIN_IMP or before <= 0:
+            continue
+        ratio = now_imp / before
+        ctr = cur["clicks"] / now_imp if now_imp else 0.0
+        if ratio >= AG_SURGE_RATIO and ctr < CTR_AD_GROUP_MIN:
+            surges.append({
+                "level": "CRITICAL",
+                "category": "ad_group_impression_surge",
+                "message": (
+                    f"Ad group '{name}' impressions jumped {before:,} -> {now_imp:,}"
+                    f" ({ratio:.1f}x) with CTR at {format_ctr_raw(ctr)}."
+                    " Possible impression surge incident"
+                ),
+                "ad_group_name": name,
+            })
+    return surges
 
 
 def save_reports(date_str: str, report_data: dict, human_text: str):
@@ -1964,6 +2424,38 @@ def main():
     # Generate alerts
     alerts = generate_alerts(campaign, ad_groups, keywords)
 
+    # ----------------------------------------------------------------
+    # Month-to-date results (moved ahead of auto-pause on 2026-07-28)
+    # The ad-group pause/resume decision needs the click budget, so fetch it first
+    # and reuse the same result in the monthly pace watch below (Ads API only = free).
+    # ----------------------------------------------------------------
+    mtd: dict | None = None
+    try:
+        _today_jst = datetime.now(tz=JST)
+        mtd = fetch_campaign_metrics(
+            client,
+            _today_jst.replace(day=1).strftime("%Y-%m-%d"),
+            _today_jst.strftime("%Y-%m-%d"),
+        )
+    except Exception as e:  # noqa: BLE001 -- on failure treat budget as zero (strict mode)
+        logger.warning("Failed to fetch month-to-date metrics: %s", e)
+
+    headroom = compute_ctr_headroom(mtd)
+    if not args.json_only:
+        if headroom["measurable"]:
+            mode = "long-tail enabled" if headroom["budget_clicks"] > 0 else "strict (no budget)"
+            print(
+                f"[INFO] Click headroom: MTD CTR {headroom['mtd_ctr']*100:.2f}%"
+                f" (target {LONGTAIL_TARGET_CTR*100:.1f}%) / surplus {headroom['surplus_clicks']:+.0f} clicks"
+                f" -> budget for low-CTR delivery {headroom['budget_clicks']:.0f} clicks"
+                f" / {headroom['days_left']:.1f} days left / mode: {mode}"
+            )
+        else:
+            print(
+                f"[INFO] Click headroom: MTD impressions {headroom['mtd_impressions']:,}"
+                f" is below the {LONGTAIL_MIN_MTD_IMP:,} needed to judge -> strict mode"
+            )
+
     # Auto-pause processing
     paused_log: list[dict] = []
     if args.auto_pause:
@@ -1981,6 +2473,97 @@ def main():
             discord=args.discord,
         )
 
+        # ---- Ad-group level auto-pause (added 2026-07-28) ----
+        # Pausing keywords alone leaves the low-CTR ad group itself serving.
+        ag_targets, ag_deferred, ag_longtail = identify_ad_group_pause_targets(
+            ad_groups, headroom=headroom, window_days=args.days,
+        )
+        if ag_longtail and not args.json_only:
+            spent = sum(ag.get("longtail_cost", 0) for ag in ag_longtail)
+            print(
+                f"[INFO] Keeping {len(ag_longtail)} low-CTR ad group(s) as long tail"
+                f" ({spent:.0f} of {headroom['budget_clicks']:.0f} budget clicks used)"
+            )
+            for ag in sorted(ag_longtail, key=lambda a: -a["impressions"])[:10]:
+                print(
+                    f"  + {ag['ad_group_name'][:50]}"
+                    f" imp={ag['impressions']:,} CTR={format_ctr_raw(ag['ctr'])}"
+                    f" cost={ag.get('longtail_cost', 0):.1f}clicks"
+                )
+        if ag_deferred:
+            msg = (
+                f"{len(ag_deferred)} ad group pause candidate(s) deferred to the next run"
+                f" (first: {ag_deferred[0]['ad_group_name']})"
+            )
+            logger.info(msg)
+            alerts.append({
+                "level": "WARNING",
+                "category": "ad_group_pause_deferred",
+                "message": msg,
+            })
+        # Long-tail groups we deliberately keep must not raise a CTR alert
+        if ag_longtail:
+            longtail_names = {ag["ad_group_name"] for ag in ag_longtail}
+            for a in alerts:
+                if a.get("category") == "ad_group_ctr" and a.get("ad_group_name") in longtail_names:
+                    a["level"] = "INFO"
+                    a["message"] += " (intentionally running within budget)"
+        if ag_targets and not args.json_only:
+            action_label = "[DRY-RUN] " if args.dry_run else ""
+            reason_label = (
+                "over budget" if headroom["budget_clicks"] > 0
+                else f"imp>={AG_PAUSE_MIN_IMP} & CTR<{CTR_AD_GROUP_MIN:.0%}"
+            )
+            print(
+                f"[INFO] {action_label}{len(ag_targets)} ad group(s) are pause targets ({reason_label})"
+            )
+            for ag in ag_targets:
+                print(
+                    f"  - {ag['ad_group_name'][:54]}"
+                    f" imp={ag['impressions']:,} CTR={format_ctr_raw(ag['ctr'])}"
+                )
+
+        ag_paused = pause_ad_groups(client, ag_targets, dry_run=args.dry_run)
+        for ag in ag_paused:
+            paused_log.append({
+                "target_type": "AD_GROUP",
+                "ad_group_id": ag["ad_group_id"],
+                "ad_group_name": ag["ad_group_name"],
+                "campaign_name": ag["campaign_name"],
+                "reason": (
+                    f"ad_group_auto_pause: 7d imp>={AG_PAUSE_MIN_IMP} & "
+                    f"CTR<{CTR_AD_GROUP_MIN:.0%} (actual imp={ag['impressions']} / "
+                    f"CTR={ag['ctr']*100:.2f}%)"
+                ),
+                "dry_run": ag.get("dry_run", False),
+            })
+
+        # ---- Long-tail resume when there is budget to spare (added 2026-07-28) ----
+        longtail_spent = sum(ag.get("longtail_cost", 0) for ag in ag_longtail)
+        ag_resume = identify_ad_group_resume_targets(
+            ad_groups, headroom, args.days, longtail_spent,
+        )
+        if ag_resume and not args.json_only:
+            action_label = "[DRY-RUN] " if args.dry_run else ""
+            print(
+                f"[INFO] {action_label}Budget allows resuming {len(ag_resume)} ad group(s)"
+                f" (cost {sum(a.get('longtail_cost', 0) for a in ag_resume):.0f} clicks)"
+            )
+            for ag in ag_resume:
+                print(
+                    f"  ^ {ag['ad_group_name'][:50]}"
+                    f" imp={ag['impressions']:,} CTR={format_ctr_raw(ag['ctr'])}"
+                )
+        resume_ad_groups(client, ag_resume, dry_run=args.dry_run)
+
+    # Impression surge detection (added 2026-07-28, diff against the previous run)
+    surge_alerts = detect_impression_surge(ad_groups)
+    if surge_alerts:
+        alerts.extend(surge_alerts)
+        if not args.json_only:
+            for a in surge_alerts:
+                print(f"[CRITICAL] {a['message']}")
+
     # ----------------------------------------------------------------
     # Monthly pace watch: Ad Grants deactivation is judged on MONTHLY CTR
     # (below 5% for two consecutive months). Watch the judged unit itself
@@ -1990,7 +2573,9 @@ def main():
         today_jst = datetime.now(tz=JST)
         month_start_str = today_jst.replace(day=1).strftime("%Y-%m-%d")
         today_str_jst = today_jst.strftime("%Y-%m-%d")
-        mtd = fetch_campaign_metrics(client, month_start_str, today_str_jst)
+        # 2026-07-28: reuse what the auto-pause decision already fetched
+        if mtd is None:
+            mtd = fetch_campaign_metrics(client, month_start_str, today_str_jst)
         if mtd and mtd.get("impressions", 0) >= 1000 and today_jst.day >= 3:
             mtd_ctr = mtd["ctr"]
             if not args.json_only:
