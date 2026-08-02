@@ -2032,6 +2032,101 @@ def fetch_ad_group_status_by_resource(client, resource_names: list[str]) -> dict
     return out
 
 
+ACCOUNT_HISTORY_START = "2026-01-01"  # How far back to look for any delivery
+
+
+def adopt_never_delivered_paused_ad_groups(client, today_str: str) -> list[dict]:
+    """Take never-delivered paused ad groups into the long-tail inventory.
+
+    Added 2026-08-02. Ad groups created by the CI-side article sync cannot be
+    registered in ag_pause_log.json -- the runner is ephemeral and the ledger
+    only exists on the operator's machine. Left alone they stay paused forever
+    and never enter any long-tail decision.
+
+    So treat Google Ads as the source of truth and pick up anything that is
+      - a "記事: " ad group in a monitored campaign, currently PAUSED, and
+      - has zero impressions since {ACCOUNT_HISTORY_START} (never delivered)
+
+    Requiring "never delivered" is what keeps manually paused ad groups out of
+    the inventory: anything a human paused necessarily has delivery history.
+    Names on the auto-resume exclusion list are skipped too.
+    """
+    svc = client.get_service("GoogleAdsService")
+    campaign_filter = build_campaign_filter()
+
+    # 1) Paused article ad groups (no date segment, so zero-history rows appear)
+    paused: dict[str, dict] = {}
+    query_all = (
+        "SELECT ad_group.id, ad_group.name, ad_group.resource_name, campaign.name "
+        f"FROM ad_group WHERE {campaign_filter} AND ad_group.status = 'PAUSED'"
+    )
+    for row in svc.search(customer_id=CUSTOMER_ID, query=query_all):
+        if not row.ad_group.name.startswith("記事: "):
+            continue
+        paused[row.ad_group.resource_name] = {
+            "ad_group_id": row.ad_group.id,
+            "ad_group_name": row.ad_group.name,
+            "campaign_name": row.campaign.name,
+            "resource_name": row.ad_group.resource_name,
+        }
+    if not paused:
+        return []
+
+    # 2) Anything with at least one impression since the start date
+    delivered: set[str] = set()
+    query_hist = (
+        "SELECT ad_group.resource_name, metrics.impressions FROM ad_group "
+        f"WHERE {campaign_filter} AND segments.date BETWEEN "
+        f"'{_validate_gaql_value(ACCOUNT_HISTORY_START, 'date')}' AND "
+        f"'{_validate_gaql_value(today_str, 'date')}'"
+    )
+    for row in svc.search(customer_id=CUSTOMER_ID, query=query_hist):
+        if row.metrics.impressions > 0:
+            delivered.add(row.ad_group.resource_name)
+
+    exclusion = load_ag_pause_exclusion()
+    try:
+        if AG_PAUSE_LOG_PATH.exists():
+            with open(AG_PAUSE_LOG_PATH, encoding="utf-8") as f:
+                entries = json.load(f).get("entries", [])
+        else:
+            entries = []
+    except Exception as e:  # noqa: BLE001 -- a broken ledger must not stop monitoring
+        logger.warning("Failed to read ad group pause log: %s", e)
+        return []
+
+    known = {e.get("resource_name") for e in entries}
+    now_iso = datetime.now(tz=JST).isoformat()
+    adopted: list[dict] = []
+    for rn, ag in paused.items():
+        if rn in known or rn in delivered:
+            continue
+        if ag["ad_group_name"] in exclusion:
+            continue
+        entries.append({
+            "paused_at": now_iso,
+            "source": "discovered_never_delivered",
+            "ad_group_id": ag["ad_group_id"],
+            "ad_group_name": ag["ad_group_name"],
+            "campaign_name": ag["campaign_name"],
+            "resource_name": rn,
+            "impressions_7d": 0,
+            "clicks_7d": 0,
+            "ctr_7d": 0.0,
+            "previous_status": "NEW",
+        })
+        adopted.append(ag)
+
+    if adopted:
+        try:
+            with open(AG_PAUSE_LOG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001 -- a failed write must not stop monitoring
+            logger.warning("Failed to update ad group pause log: %s", e)
+            return []
+    return adopted
+
+
 def identify_ad_group_resume_targets(
     ad_groups: list[dict],
     headroom: dict,
@@ -2684,6 +2779,22 @@ def main():
                 ),
                 "dry_run": ag.get("dry_run", False),
             })
+
+        # ---- Take never-delivered ad groups into inventory (added 2026-08-02) ----
+        # Groups created by the CI-side sync cannot register themselves, so pick
+        # them up from Google Ads instead.
+        try:
+            adopted = adopt_never_delivered_paused_ad_groups(
+                client, datetime.now(tz=JST).strftime("%Y-%m-%d")
+            )
+            if adopted and not args.json_only:
+                print(f"[INFO] Took {len(adopted)} never-delivered ad group(s) into the long-tail inventory")
+                for ag in adopted[:10]:
+                    print(f"  + {ag['ad_group_name'][:60]}")
+                if len(adopted) > 10:
+                    print(f"  ... and {len(adopted) - 10} more")
+        except Exception as e:  # noqa: BLE001 -- inventory pickup must not stop monitoring
+            logger.warning("Failed to take never-delivered ad groups into inventory: %s", e)
 
         # ---- Long-tail resume when there is budget to spare (added 2026-07-28) ----
         longtail_spent = sum(ag.get("longtail_cost", 0) for ag in ag_longtail)

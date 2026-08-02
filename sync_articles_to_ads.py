@@ -703,10 +703,19 @@ def get_or_create_ad_group(client, ga_service, campaign_resource: str, slug: str
       1. New groups are always created PAUSED. The monitor's long-tail operation
          eases them into delivery within the month's CTR headroom. Enabling a large
          batch at once reproduces the 2026-06 collapse (weekly 8.81% -> 4.50%).
-      2. Groups the monitor paused (listed in ag_pause_log.json /
-         ag_pause_exclusion.json) stay PAUSED. Previously a published article
-         unconditionally forced ENABLED, so the sync kept reviving whatever the
-         monitor had stopped -- a tug of war found on 2026-08-02.
+      2. **The sync never enables an ad group.** Only monitor_ad_performance.py
+         decides when delivery starts. Previously a published article
+         unconditionally forced PAUSED -> ENABLED, so the sync kept reviving
+         whatever the monitor had stopped -- a tug of war found on 2026-08-02.
+
+         The first attempt guarded this with the pause ledger, but
+         ag_pause_log.json is not in version control and does not exist in a
+         GitHub Actions checkout, so the guard was a no-op in CI: run
+         30757373890 flipped 4 groups back to ENABLED. Dropping the transition
+         removes the dependency on the ledger being present.
+
+         The reverse direction (ENABLED -> PAUSED, when an article goes back to
+         draft) is the safe way round and is still allowed.
     """
     if not _validate_resource_name(campaign_resource):
         raise ValueError(f"Invalid campaign resource name: {campaign_resource}")
@@ -732,14 +741,14 @@ def get_or_create_ad_group(client, ga_service, campaign_resource: str, slug: str
         resource_name = rows[0].ad_group.resource_name
         current_status = rows[0].ad_group.status.name
 
-        # Leave the monitor's decisions alone (no tug of war)
-        if (current_status == "PAUSED" and desired_status_name == "ENABLED"
-                and group_name in (monitor_paused or set())):
-            print(f"  -> Ad group \"{group_name}\" was paused by the monitor; keeping it PAUSED"
-                  " (it resumes automatically once there is CTR headroom)")
+        # The sync never enables. Starting delivery is the monitor's call alone.
+        if current_status == "PAUSED" and desired_status_name == "ENABLED":
+            note = " (also listed in the monitor's pause ledger)" if group_name in (monitor_paused or set()) else ""
+            print(f"  -> Ad group \"{group_name}\" is paused; keeping it PAUSED{note}."
+                  " The monitor starts delivery once there is CTR headroom")
             return resource_name
 
-        # Update if status has changed
+        # Update if status has changed (only the safe ENABLED -> PAUSED reaches here)
         if current_status != desired_status_name:
             print(f"  -> Changing ad group \"{group_name}\" from {current_status} to {desired_status_name}...")
             ag_service = client.get_service("AdGroupService")
