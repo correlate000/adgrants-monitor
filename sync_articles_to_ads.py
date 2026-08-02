@@ -69,6 +69,12 @@ CONTENT_REPO_DIR = Path(
 CONTENT_DIR = CONTENT_REPO_DIR / "src/content/ja"
 GOOGLE_ADS_YAML = SCRIPT_DIR / "google-ads.yaml"
 
+# Shared with monitor_ad_performance.py (added 2026-08-02)
+# Ledger of ad groups the monitor paused for low CTR. The sync must not revive
+# anything listed here (see IMPORTANT in get_or_create_ad_group).
+AG_PAUSE_LOG_PATH = SCRIPT_DIR / "ag_pause_log.json"
+AG_PAUSE_EXCLUSION_PATH = SCRIPT_DIR / "ag_pause_exclusion.json"
+
 # Ad Grants target categories (exclude news)
 AD_CONTENT_CATEGORIES = ["columns", "guides"]
 # labs uses a subdirectory structure and is handled separately
@@ -626,10 +632,82 @@ def _resolve_ad_group_status(client, article_status: str):
     return client.enums.AdGroupStatusEnum.PAUSED
 
 
+def load_monitor_paused_names() -> set[str]:
+    """Names of ad groups the monitor deliberately paused (added 2026-08-02).
+
+    ag_pause_log.json      -- auto/bulk pause ledger (the long-tail backlog)
+    ag_pause_exclusion.json -- groups barred from automatic resume after a surge
+
+    An unreadable ledger yields an empty set; the caller then cannot protect
+    anything, so treat that as "do not resume".
+    """
+    names: set[str] = set()
+    for path, key in ((AG_PAUSE_LOG_PATH, "entries"), (AG_PAUSE_EXCLUSION_PATH, "entries")):
+        try:
+            if not path.exists():
+                continue
+            import json as _json
+            with open(path, encoding="utf-8") as f:
+                for e in _json.load(f).get(key, []):
+                    name = e.get("ad_group_name")
+                    if name:
+                        names.add(name)
+        except Exception as e:  # noqa: BLE001 -- a broken ledger must not stop the sync
+            print(f"  [WARN] Failed to read pause ledger {path.name}: {e}", file=sys.stderr)
+    return names
+
+
+def register_new_ad_group_in_longtail_pool(
+    ad_group_id: int, group_name: str, campaign_name: str, resource_name: str
+) -> None:
+    """Register a freshly created ad group as long-tail inventory (added 2026-08-02).
+
+    New groups are created PAUSED. The monitor eases them into delivery a few at a
+    time, within the month's CTR headroom. Zero history (impressions_7d = 0) is the
+    marker for "never tried yet".
+    """
+    import json as _json
+    try:
+        if AG_PAUSE_LOG_PATH.exists():
+            with open(AG_PAUSE_LOG_PATH, encoding="utf-8") as f:
+                entries = _json.load(f).get("entries", [])
+        else:
+            entries = []
+        if any(e.get("resource_name") == resource_name for e in entries):
+            return
+        entries.append({
+            "paused_at": datetime.now(timezone(timedelta(hours=9))).isoformat(),
+            "source": "new_article_sync",
+            "ad_group_id": ad_group_id,
+            "ad_group_name": group_name,
+            "campaign_name": campaign_name,
+            "resource_name": resource_name,
+            "impressions_7d": 0,
+            "clicks_7d": 0,
+            "ctr_7d": 0.0,
+            "previous_status": "NEW",
+        })
+        with open(AG_PAUSE_LOG_PATH, "w", encoding="utf-8") as f:
+            _json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001 -- a failed ledger write must not undo the sync
+        print(f"  [WARN] Failed to register in long-tail pool: {e}", file=sys.stderr)
+
+
 def get_or_create_ad_group(client, ga_service, campaign_resource: str, slug: str,
-                           article_status: str = "draft") -> str:
+                           article_status: str = "draft",
+                           monitor_paused: Optional[set[str]] = None,
+                           campaign_name: str = "") -> str:
     """Get/create the ad group corresponding to the article slug.
-    Updates ad group status based on article_status for existing groups."""
+
+    IMPORTANT (design change, 2026-08-02):
+      1. New groups are always created PAUSED. The monitor's long-tail operation
+         eases them into delivery within the month's CTR headroom. Enabling a large
+         batch at once reproduces the 2026-06 collapse (weekly 8.81% -> 4.50%).
+      2. Groups the monitor paused (listed in ag_pause_log.json /
+         ag_pause_exclusion.json) stay PAUSED. Previously a published article
+         unconditionally forced ENABLED, so the sync kept reviving whatever the
+         monitor had stopped -- a tug of war found on 2026-08-02.
+    """
     if not _validate_resource_name(campaign_resource):
         raise ValueError(f"Invalid campaign resource name: {campaign_resource}")
     # Slug validation (GAQL injection prevention)
@@ -639,11 +717,10 @@ def get_or_create_ad_group(client, ga_service, campaign_resource: str, slug: str
     # Slug is already validated; also explicitly check derived string before GAQL embedding
     if "'" in group_name:
         raise ValueError(f"Ad group name contains single quote: {group_name!r}")
-    desired_status = _resolve_ad_group_status(client, article_status)
     desired_status_name = "ENABLED" if article_status == "published" else "PAUSED"
 
     query = f"""
-        SELECT ad_group.resource_name, ad_group.name, ad_group.status
+        SELECT ad_group.id, ad_group.resource_name, ad_group.name, ad_group.status
         FROM ad_group
         WHERE campaign.resource_name = '{campaign_resource}'
           AND ad_group.name = '{group_name}'
@@ -655,13 +732,20 @@ def get_or_create_ad_group(client, ga_service, campaign_resource: str, slug: str
         resource_name = rows[0].ad_group.resource_name
         current_status = rows[0].ad_group.status.name
 
+        # Leave the monitor's decisions alone (no tug of war)
+        if (current_status == "PAUSED" and desired_status_name == "ENABLED"
+                and group_name in (monitor_paused or set())):
+            print(f"  -> Ad group \"{group_name}\" was paused by the monitor; keeping it PAUSED"
+                  " (it resumes automatically once there is CTR headroom)")
+            return resource_name
+
         # Update if status has changed
         if current_status != desired_status_name:
             print(f"  -> Changing ad group \"{group_name}\" from {current_status} to {desired_status_name}...")
             ag_service = client.get_service("AdGroupService")
             op = client.get_type("AdGroupOperation")
             op.update.resource_name = resource_name
-            op.update.status = desired_status
+            op.update.status = _resolve_ad_group_status(client, article_status)
             if field_mask_pb2 is None:
                 raise RuntimeError("google.protobuf is not available. Check your google-ads package installation.")
             op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["status"]))
@@ -670,18 +754,31 @@ def get_or_create_ad_group(client, ga_service, campaign_resource: str, slug: str
 
         return resource_name
 
-    # Create new ad group
+    # Create new ad group -- always PAUSED, even for published articles.
+    # Delivery is started by the monitor's long-tail operation.
     ag_service = client.get_service("AdGroupService")
     op = client.get_type("AdGroupOperation")
     ag = op.create
     ag.name = group_name
     ag.campaign = campaign_resource
-    ag.status = desired_status
+    ag.status = client.enums.AdGroupStatusEnum.PAUSED
     ag.type_ = client.enums.AdGroupTypeEnum.SEARCH_STANDARD
     ag.cpc_bid_micros = MAX_CPC_MICROS
-    print(f"  -> Creating ad group \"{group_name}\" ({desired_status_name})")
+    print(f"  -> Creating ad group \"{group_name}\" (PAUSED;"
+          " the long-tail operation decides when to start delivery)")
     result = ag_service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=[op])
-    return result.results[0].resource_name
+    new_resource_name = result.results[0].resource_name
+
+    # Register as long-tail inventory. Zero history marks it as never tried.
+    if article_status == "published":
+        try:
+            new_id = int(new_resource_name.rsplit("/", 1)[-1])
+        except ValueError:
+            new_id = 0
+        register_new_ad_group_in_longtail_pool(
+            new_id, group_name, campaign_name, new_resource_name
+        )
+    return new_resource_name
 
 
 def sync_keywords(client, ga_service, ad_group_resource: str, keywords: list[str]) -> tuple[int, list[str]]:
@@ -814,7 +911,8 @@ def upsert_rsa(client, ga_service, ad_group_resource: str,
 
 def sync_article(slug: str, dry_run: bool, force: bool,
                   ads_client=None, ga_service=None,
-                  campaign_info: Optional[tuple[str, str]] = None) -> dict:
+                  campaign_info: Optional[tuple[str, str]] = None,
+                  monitor_paused: Optional[set[str]] = None) -> dict:
     """
     Sync one article.
 
@@ -902,7 +1000,10 @@ def sync_article(slug: str, dry_run: bool, force: bool,
             campaign_resource, campaign_status = result
 
         article_status = _infer_article_status(article)
-        ad_group_resource = get_or_create_ad_group(client, svc, campaign_resource, slug, article_status)
+        ad_group_resource = get_or_create_ad_group(
+            client, svc, campaign_resource, slug, article_status,
+            monitor_paused=monitor_paused, campaign_name=CAMPAIGN_NAME,
+        )
         kw_added, kw_rejected = sync_keywords(client, svc, ad_group_resource, keywords)
 
         # Create RSA (skip on policy violation and continue; CREATE-first design preserves existing RSA)
@@ -1000,12 +1101,18 @@ def main():
         ads_ga_service = ads_client.get_service("GoogleAdsService")
         campaign_info = get_or_create_campaign_resource(ads_client, ads_ga_service)
 
+    # Read the monitor's pause ledger once, so the sync never revives what it stopped
+    monitor_paused = load_monitor_paused_names()
+    if monitor_paused:
+        print(f"Ad groups paused by the monitor: {len(monitor_paused)} (the sync will not resume them)")
+
     results = []
     for slug in slugs:
         try:
             result = sync_article(slug, dry_run=args.dry_run, force=args.force,
                                   ads_client=ads_client, ga_service=ads_ga_service,
-                                  campaign_info=campaign_info)
+                                  campaign_info=campaign_info,
+                                  monitor_paused=monitor_paused)
         except Exception as e:
             print(f"\n[{slug}] [ERROR] Unexpected error: {e}", file=sys.stderr)
             result = {"slug": slug, "success": False, "message": f"Unexpected error: {e}"}

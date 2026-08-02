@@ -83,6 +83,21 @@ LONGTAIL_MIN_MTD_IMP = 5000      # Below this MTD volume the budget is not measu
 LONGTAIL_RESUME_MARGIN = 1.5     # Resume only with 1.5x the cost in budget (anti-flapping)
 LONGTAIL_RESUME_MAX_PER_RUN = 10  # Resume cap per run
 
+# Trial slots for brand-new articles (added 2026-08-02)
+# The article sync creates every new ad group PAUSED and registers it in
+# ag_pause_log.json with source="new_article_sync" / impressions_7d=0.
+# Those never-delivered groups are eased into delivery a few at a time.
+#
+# Why not enable them all at once: in 2026-06 a jump from 793 to 5,782 broad-match
+# keywords dropped the weekly CTR from 8.81% to 4.50%. New keywords are phrase match
+# now, which is safer, but 171 articles x ~10 terms in one go is the same shape.
+#
+# Groups with no history cannot have their cost estimated from measurements, so a
+# flat click cost is charged per trial. A tight month stops trials automatically;
+# a roomy month runs through the backlog faster.
+LONGTAIL_EXPLORE_MAX_PER_RUN = 5   # Trial cap per run (2 runs/day = up to 10/day)
+LONGTAIL_EXPLORE_COST_CLICKS = 3.0  # Assumed cost of running one new group to month end
+
 # Per-campaign PAUSE criteria (type definitions in config.CAMPAIGN_PAUSE_TYPE)
 CV_PAUSE_MIN_CLICKS = 20        # cv type: pause if click >= 20 and CV < 0.5
 CTR_KW_PAUSE_100IMP = 0.03      # ctr type: auto-pause if 100+ imp and CTR < 3%
@@ -1986,11 +2001,43 @@ def pause_ad_groups(client, targets: list[dict], dry_run: bool = False) -> list[
     return [dict(ag, dry_run=False) for ag in targets]
 
 
+def fetch_ad_group_status_by_resource(client, resource_names: list[str]) -> dict[str, str]:
+    """Look up the current status of specific ad groups (added 2026-08-02).
+
+    The regular ad group query is segmented by date, so groups with no delivery at
+    all are never returned. Putting brand-new (PAUSED, zero-history) groups into the
+    trial pool therefore needs a separate, date-free lookup.
+    """
+    if not resource_names:
+        return {}
+    out: dict[str, str] = {}
+    svc = client.get_service("GoogleAdsService")
+    # Keep the IN clause from growing without bound
+    for i in range(0, len(resource_names), 200):
+        chunk = resource_names[i:i + 200]
+        # These come from a JSON ledger and go straight into GAQL -- check the shape
+        for rn in chunk:
+            if not re.fullmatch(r"customers/\d+/adGroups/\d+", rn):
+                raise ValueError(f"Malformed resource name: {rn!r}")
+        rn_list = ", ".join(f"'{rn}'" for rn in chunk)
+        query = (
+            "SELECT ad_group.resource_name, ad_group.name, ad_group.status "
+            f"FROM ad_group WHERE ad_group.resource_name IN ({rn_list})"
+        )
+        try:
+            for row in svc.search(customer_id=CUSTOMER_ID, query=query):
+                out[row.ad_group.resource_name] = row.ad_group.status.name
+        except Exception as e:  # noqa: BLE001 -- a failed lookup must not stop monitoring
+            logger.warning("Failed to look up ad group status: %s", e)
+    return out
+
+
 def identify_ad_group_resume_targets(
     ad_groups: list[dict],
     headroom: dict,
     window_days: int,
     already_spent: float,
+    client=None,
 ) -> list[dict]:
     """Pick auto-paused ad groups to resume while the click budget allows it.
 
@@ -2013,14 +2060,48 @@ def identify_ad_group_resume_targets(
     # resource_name was added to the query on 2026-07-28; tolerate older shapes
     current = {ag["resource_name"]: ag for ag in ad_groups if ag.get("resource_name")}
 
+    # Never-delivered groups do not appear in the date-segmented query, so pull
+    # them from the ledger and look up their status separately.
+    unseen = [
+        e for e in entries
+        if e.get("resource_name") and e.get("ad_group_name")
+        and e["ad_group_name"] not in exclusion
+        and e["resource_name"] not in current
+        and not e.get("impressions_7d", 0)
+    ]
+    unseen_status: dict[str, str] = {}
+    if unseen and client is not None:
+        unseen_status = fetch_ad_group_status_by_resource(
+            client, [e["resource_name"] for e in unseen]
+        )
+
     candidates: list[dict] = []
+    explore: list[dict] = []  # Zero-history newcomers (trial slots, added 2026-08-02)
     for e in entries:
         rn = e.get("resource_name")
         name = e.get("ad_group_name")
         if not rn or not name or name in exclusion:
             continue
         ag = current.get(rn)
-        if not ag or ag.get("status") != "PAUSED":
+        if ag is None:
+            # Absent from the metrics query = never delivered. Freshly synced
+            # articles land here.
+            if unseen_status.get(rn) != "PAUSED":
+                continue  # Already running, removed, or the lookup failed
+            explore.append({
+                "ad_group_name": name,
+                "resource_name": rn,
+                "campaign_name": e.get("campaign_name", ""),
+                "impressions": 0,
+                "clicks": 0,
+                "ctr": 0.0,
+                "status": "PAUSED",
+                "registered_at": e.get("paused_at", ""),
+                "explore": True,
+                "longtail_cost": LONGTAIL_EXPLORE_COST_CLICKS,
+            })
+            continue
+        if ag.get("status") != "PAUSED":
             continue  # Already running, or outside the current scope
         # Long-paused groups have no impressions left in the trailing window,
         # so fall back to the performance recorded at pause time
@@ -2034,12 +2115,15 @@ def identify_ad_group_resume_targets(
                 "ctr": e.get("ctr_7d", 0.0),
             }
         else:
-            continue  # No data at all -- cost cannot be estimated
+            # No data at all = never delivered. Handle as a trial slot instead.
+            explore.append(dict(ag, registered_at=e.get("paused_at", ""),
+                                explore=True, longtail_cost=LONGTAIL_EXPLORE_COST_CLICKS))
+            continue
         candidates.append(basis)
 
     remaining = headroom["budget_clicks"] - already_spent
     resume: list[dict] = []
-    # Cheapest (highest CTR) first
+    # Proven groups first, cheapest (highest CTR) first within them
     for ag in sorted(candidates, key=lambda a: -a["ctr"]):
         cost = estimate_longtail_cost(ag, headroom, window_days)
         if cost <= 0:
@@ -2048,7 +2132,19 @@ def identify_ad_group_resume_targets(
             remaining -= cost
             resume.append(dict(ag, longtail_cost=round(cost, 1)))
         if len(resume) >= LONGTAIL_RESUME_MAX_PER_RUN:
+            return resume
+
+    # Spend whatever is left on trials, oldest registration first so every
+    # article eventually gets its turn.
+    explored = 0
+    for ag in sorted(explore, key=lambda a: a.get("registered_at", "")):
+        if explored >= LONGTAIL_EXPLORE_MAX_PER_RUN:
             break
+        if LONGTAIL_EXPLORE_COST_CLICKS * LONGTAIL_RESUME_MARGIN > remaining:
+            break
+        remaining -= LONGTAIL_EXPLORE_COST_CLICKS
+        resume.append(ag)
+        explored += 1
     return resume
 
 
@@ -2592,17 +2688,21 @@ def main():
         # ---- Long-tail resume when there is budget to spare (added 2026-07-28) ----
         longtail_spent = sum(ag.get("longtail_cost", 0) for ag in ag_longtail)
         ag_resume = identify_ad_group_resume_targets(
-            ad_groups, headroom, args.days, longtail_spent,
+            ad_groups, headroom, args.days, longtail_spent, client=client,
         )
         if ag_resume and not args.json_only:
             action_label = "[DRY-RUN] " if args.dry_run else ""
+            n_new = sum(1 for a in ag_resume if a.get("explore"))
+            n_back = len(ag_resume) - n_new
             print(
-                f"[INFO] {action_label}Budget allows resuming {len(ag_resume)} ad group(s)"
-                f" (cost {sum(a.get('longtail_cost', 0) for a in ag_resume):.0f} clicks)"
+                f"[INFO] {action_label}Budget allows delivering {len(ag_resume)} ad group(s)"
+                f" (resumed {n_back} / new trials {n_new},"
+                f" cost {sum(a.get('longtail_cost', 0) for a in ag_resume):.0f} clicks)"
             )
             for ag in ag_resume:
+                mark = "+" if ag.get("explore") else "^"
                 print(
-                    f"  ^ {ag['ad_group_name'][:50]}"
+                    f"  {mark} {ag['ad_group_name'][:50]}"
                     f" imp={ag['impressions']:,} CTR={format_ctr_raw(ag['ctr'])}"
                 )
         resume_ad_groups(client, ag_resume, dry_run=args.dry_run)
