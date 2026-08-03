@@ -416,18 +416,81 @@ _AD_TEXT_BANNED = re.compile(
 def sanitize_ad_text(text: str) -> str:
     """Strip characters that are not allowed in ad text (added 2026-08-03).
 
-    Banned characters become a space, then spaces are collapsed -- deleting them
-    outright would glue numbers together ("80→85万円" -> "8085万円").
-    Repeated punctuation and dashes are collapsed too; repetition is itself a
-    disapproval reason.
+    Arrows carry meaning, so they are translated rather than dropped:
+      between digits  "80→85万円"      -> "80から85万円"  (a range / a shift)
+      otherwise       "企画→設計→制作"  -> "企画、設計、制作" (a sequence)
+
+    Replacing them with a plain space produces "80 85万円", which reads as
+    nothing at all. Repeated punctuation and dashes are collapsed too;
+    repetition is itself a disapproval reason.
     """
     if not text:
         return ""
-    t = _AD_TEXT_BANNED.sub(" ", text)
+    t = text
+    t = re.sub(r"(\d)\s*[←-⇿⟰-⟿⤀-⥿]\s*(\d)", r"\1から\2", t)
+    t = re.sub(r"\s*[←-⇿⟰-⟿⤀-⥿]\s*", "、", t)
+    t = _AD_TEXT_BANNED.sub(" ", t)
+    t = re.sub(r"、\s*、+", "、", t)
     t = re.sub(r"([。、，,.？?])\1+", r"\1", t)
     t = re.sub(r"([ー－—–\-]){2,}", r"\1", t)
-    t = re.sub(r"[ 　]+", " ", t).strip()
-    return t
+    t = re.sub(r"[ 　]+", " ", t)
+    t = re.sub(r"\s*、\s*", "、", t)
+    return t.strip().strip("、")
+
+
+# Where a headline may be cut (added 2026-08-03)
+# Cutting purely on width chopped titles mid-word and left brackets open
+# ("後期高齢者保険料上限「80から85"). Cut only at a meaning boundary.
+_HEADLINE_CUT_AFTER = "：:、。，,！!？?）)」』】〉》"    # may cut right after these
+_HEADLINE_CUT_BEFORE = "：:—–〜~（(「『【〈《"           # may cut right before these
+# Below this width the fragment is not worth using (8 full-width chars).
+# A headline of just "文献マップ" says nothing about the article; the ~8
+# keyword-derived headlines cover it instead.
+HEADLINE_MIN_WIDTH = 16
+
+_BRACKET_PAIRS = (("「", "」"), ("『", "』"), ("（", "）"), ("(", ")"),
+                  ("【", "】"), ("〈", "〉"), ("《", "》"), ("[", "]"))
+
+
+def _brackets_balanced(s: str) -> bool:
+    """Whether every opened bracket is closed. Unbalanced headlines look broken."""
+    return all(s.count(o) == s.count(c) for o, c in _BRACKET_PAIRS)
+
+
+def headline_from_title(title: str, max_width: int = HEADLINE_MAX_WIDTH) -> str:
+    """Build a headline from the article title without cutting mid-word.
+
+    Returns the title as-is when it fits. Otherwise takes the longest prefix
+    that ends at a meaning boundary and still fits. When no boundary works, or
+    the fragment would be too short, returns "" and the caller drops the
+    title-derived headline (keyword-derived headlines carry the ad).
+
+    The Google Ads headline limit of 30 counts full-width characters as 2, so
+    Japanese titles get roughly 15 characters -- most titles simply do not fit.
+    """
+    s = sanitize_ad_text(title)
+    if not s:
+        return ""
+    if display_width(s) <= max_width:
+        return s
+
+    best = ""
+    width = 0
+    for i, c in enumerate(s):
+        w = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if width + w > max_width:
+            break
+        width += w
+        is_cut = c in _HEADLINE_CUT_AFTER or (
+            i + 1 < len(s) and s[i + 1] in _HEADLINE_CUT_BEFORE
+        )
+        if not is_cut:
+            continue
+        cand = s[:i + 1].rstrip("：:、。，,—–〜~ 　")
+        if _brackets_balanced(cand):
+            best = cand
+
+    return best if display_width(best) >= HEADLINE_MIN_WIDTH else ""
 
 
 def build_rsa_headlines(article: dict, keywords: list[str]) -> list[str]:
@@ -440,9 +503,10 @@ def build_rsa_headlines(article: dict, keywords: list[str]) -> list[str]:
     headlines = []
 
     # Headline 1: article title (intended for pin position 1)
-    title_truncated = truncate_to_width(sanitize_ad_text(article["title"]), HEADLINE_MAX_WIDTH)
-    if title_truncated:
-        headlines.append(title_truncated)
+    # Cut at a meaning boundary, not on raw width; drop it if nothing fits.
+    title_headline = headline_from_title(article["title"])
+    if title_headline:
+        headlines.append(title_headline)
 
     # Headline 2+: keywords used directly
     for kw in keywords:
