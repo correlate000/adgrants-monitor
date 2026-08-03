@@ -61,6 +61,25 @@ AG_PAUSE_MAX_PER_RUN = 10       # Blast-radius cap for unattended runs; rest is 
 AG_MIN_ENABLED = 20             # Never pause below this many enabled ad groups
 AG_ALERT_CRITICAL_MIN_IMP = 100  # 5% breach at this volume is CRITICAL (i.e. e-mailed)
 
+# Never pause an ad group that is converting (added 2026-08-04)
+# Background: an ad group was paused for a 2.78% CTR over a 7-day window (144
+# impressions, 4 clicks). That same ad group produced 13 of the account's 23
+# conversions that month -- 57% of everything the account achieved -- at a
+# click-to-conversion rate of 34.2%, by far the best in the account. We paused the
+# only thing that was working, in order to protect a click-through rate.
+#
+# It did not even protect the rate. Over 30 days that ad group ran at 6.22% CTR
+# against an account average of 5.34%; including it makes the account CTR 0.005
+# points *higher*. The 7-day window happened to catch a bad slice.
+#
+# It carries 0.57% of impressions, so protecting it costs nothing measurable, while
+# pausing it costs 57% of results. The trade is asymmetric, so err on protecting.
+#
+# Note we do NOT raise AG_PAUSE_MIN_IMP. A larger eligibility floor lets borderline
+# offenders slip through every run. This is not a floor -- it is protection by value,
+# applied on a separate axis.
+AG_PAUSE_CV_PROTECT = 1.0       # Conversions in-window at or above this: never auto-pause
+
 # Impression surge detection (added 2026-07-28)
 # Compare against the previous run's report JSON to catch an ad group whose
 # impressions explode while CTR collapses, within the same day.
@@ -1866,16 +1885,34 @@ def identify_ad_group_pause_targets(
     Criteria: ENABLED, impressions >= AG_PAUSE_MIN_IMP, CTR < CTR_AD_GROUP_MIN.
     Candidates affordable within the click budget are kept. The eligibility floor is
     deliberately small: a large floor lets borderline offenders slip through every time.
+
+    Ad groups with at least AG_PAUSE_CV_PROTECT conversions in-window are excluded.
+    Pausing what converts in order to protect a click-through rate inverts ends and
+    means (see the constant for the incident this prevents).
     """
     exclusion = load_ag_pause_exclusion()
     enabled = [ag for ag in ad_groups if ag.get("status") == "ENABLED"]
 
-    candidates = [
+    low_ctr = [
         ag for ag in enabled
         if ag["impressions"] >= AG_PAUSE_MIN_IMP
         and ag["ctr"] < CTR_AD_GROUP_MIN
         and ag["ad_group_name"] not in exclusion
     ]
+
+    # Keep what converts. Always say what was spared -- never trim silently.
+    candidates = []
+    for ag in low_ctr:
+        if ag.get("conversions", 0.0) >= AG_PAUSE_CV_PROTECT:
+            logger.warning(
+                "Sparing %s (%s): %d impr / %d clicks / %.2f%% CTR / %.1f conversions. "
+                "Tighten its keywords instead of pausing it",
+                ag["ad_group_name"], ag.get("campaign_name", "-"),
+                ag["impressions"], ag["clicks"], ag["ctr"] * 100,
+                ag.get("conversions", 0.0),
+            )
+            continue
+        candidates.append(ag)
 
     # Spend the budget cheapest-first (i.e. highest CTR first)
     kept: list[dict] = []
