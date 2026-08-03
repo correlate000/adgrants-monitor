@@ -462,7 +462,16 @@ def _brackets_balanced(s: str) -> bool:
 #   "クレーム1本で2,100食が消えた日" <- ends on a noun, reads on its own
 # Dropping every title without punctuation loses the second kind too, so the
 # ending is inspected instead.
-_TRAILING_PARTICLES = ("を", "が", "は", "に", "へ", "の", "と", "や", "から", "まで", "より")
+_TRAILING_PARTICLES = ("を", "が", "は", "に", "へ", "の", "と", "や", "で", "から", "まで", "より")
+
+# Ending on an interrogative demands a clause that is no longer there.
+#   "苦情空白という現象 — なぜ"  <- the clause after なぜ is gone
+# The rule that allows cutting before an opening bracket makes this shape easy
+# to produce, so it is screened separately.
+_TRAILING_INTERROGATIVES = (
+    "なぜ", "なぜか", "どう", "どうして", "いかに", "どこ", "いつ", "だれ", "誰",
+    "何", "なに", "どの", "どんな", "いくら", "どれ", "この", "その", "あの",
+)
 
 # Ending on の is fine when the word is a nominaliser -- the phrase is complete.
 #   "「無償化」されないもの"          <- complete (もの is a noun)
@@ -475,9 +484,11 @@ _HEADLINE_TRAILING_BAD = "：:、。，,—–〜~・･｜|／/＆& 　"
 
 
 def _ends_incomplete(h: str) -> bool:
-    """Whether the text ends on a particle and reads as cut mid-sentence."""
+    """Whether the text ends on a particle or interrogative and reads cut short."""
     if any(h.endswith(n) for n in _TRAILING_NOMINALIZERS):
         return False
+    if any(h.endswith(q) for q in _TRAILING_INTERROGATIVES):
+        return True
     return any(h.endswith(p) for p in _TRAILING_PARTICLES)
 
 
