@@ -462,10 +462,23 @@ def _brackets_balanced(s: str) -> bool:
 #   "クレーム1本で2,100食が消えた日" <- ends on a noun, reads on its own
 # Dropping every title without punctuation loses the second kind too, so the
 # ending is inspected instead.
-_TRAILING_PARTICLES = (
-    "を", "が", "は", "に", "の", "へ", "と", "で", "も", "や", "から", "まで",
-    "より", "など", "とは", "には", "では", "ため", "こと", "する", "した", "れる",
-)
+_TRAILING_PARTICLES = ("を", "が", "は", "に", "へ", "の", "と", "や", "から", "まで", "より")
+
+# Ending on の is fine when the word is a nominaliser -- the phrase is complete.
+#   "「無償化」されないもの"          <- complete (もの is a noun)
+#   "介護人材危機の構造 — 2040年の"   <- incomplete (の is a case particle)
+_TRAILING_NOMINALIZERS = ("もの", "こと", "ところ", "とき", "ほう", "わけ", "ため", "はず")
+
+# Characters that must not end a headline. Missing ・ and ｜ let
+# "愛知・静岡・" and "全国165｜" reach production.
+_HEADLINE_TRAILING_BAD = "：:、。，,—–〜~・･｜|／/＆& 　"
+
+
+def _ends_incomplete(h: str) -> bool:
+    """Whether the text ends on a particle and reads as cut mid-sentence."""
+    if any(h.endswith(n) for n in _TRAILING_NOMINALIZERS):
+        return False
+    return any(h.endswith(p) for p in _TRAILING_PARTICLES)
 
 
 def _is_kanji(c: str) -> bool:
@@ -489,14 +502,16 @@ def _is_readable_ending(cand: str, rest: str) -> bool:
         return False
     if not _brackets_balanced(cand):
         return False
-    if cand[-1] in "：:、。，,—–〜~ 　":
+    if cand[-1] in _HEADLINE_TRAILING_BAD:
         return False
-    if any(cand.endswith(p) for p in _TRAILING_PARTICLES):
+    if _ends_incomplete(cand):
         return False
     if not rest:
         return True
     last, nxt = cand[-1], rest[0]
     if last.isdigit() and (nxt.isdigit() or nxt in ",，."):
+        return False
+    if last.isdigit() and _is_kanji(nxt):  # a counter/unit follows the number
         return False
     if last.isascii() and last.isalpha() and nxt.isalpha():
         return False
@@ -540,8 +555,8 @@ def headline_from_title(title: str, max_width: int = HEADLINE_MAX_WIDTH) -> str:
         )
         if not is_cut:
             continue
-        trimmed = cand.rstrip("：:、。，,—–〜~ 　")
-        if _brackets_balanced(trimmed):
+        trimmed = cand.rstrip(_HEADLINE_TRAILING_BAD)
+        if _brackets_balanced(trimmed) and not _ends_incomplete(trimmed):
             best = trimmed
 
     chosen = best if display_width(best) >= HEADLINE_MIN_WIDTH else fallback
