@@ -467,7 +467,7 @@ _TRAILING_PARTICLES = ("を", "が", "は", "に", "へ", "の", "と", "や", "
 # Ending on の is fine when the word is a nominaliser -- the phrase is complete.
 #   "「無償化」されないもの"          <- complete (もの is a noun)
 #   "介護人材危機の構造 — 2040年の"   <- incomplete (の is a case particle)
-_TRAILING_NOMINALIZERS = ("もの", "こと", "ところ", "とき", "ほう", "わけ", "ため", "はず")
+_TRAILING_NOMINALIZERS = ("もの", "こと", "ところ", "とき", "ほう", "わけ", "ため", "はず", "とは")
 
 # Characters that must not end a headline. Missing ・ and ｜ let
 # "愛知・静岡・" and "全国165｜" reach production.
@@ -550,9 +550,10 @@ def headline_from_title(title: str, max_width: int = HEADLINE_MAX_WIDTH) -> str:
         cand = s[:i + 1]
         if _is_readable_ending(cand, s[i + 1:]):
             fallback = cand
-        is_cut = c in _HEADLINE_CUT_AFTER or (
-            i + 1 < len(s) and s[i + 1] in _HEADLINE_CUT_BEFORE
-        )
+        # Titles write the dash as "現象 — なぜ", so skip whitespace when looking
+        # ahead; otherwise the dash is never reached and never acts as a boundary.
+        nxt = s[i + 1:].lstrip(" 　")
+        is_cut = c in _HEADLINE_CUT_AFTER or (nxt and nxt[0] in _HEADLINE_CUT_BEFORE)
         if not is_cut:
             continue
         trimmed = cand.rstrip(_HEADLINE_TRAILING_BAD)
