@@ -397,15 +397,50 @@ Keyword candidates:"""
 # RSA text generation
 # ===========================================================================
 
+# Characters that get an ad disapproved under the Google Ads
+# "Punctuation & symbols" policy (added 2026-08-03).
+# Headline 1 was a verbatim copy of the article title, so an arrow in the title
+# went straight into the ad and it was disapproved. Removing the symbol outright
+# would turn "80→85万円" into "8085万円" and change the number, so replace with a
+# space instead.
+_AD_TEXT_BANNED = re.compile(
+    r"[←-⇿⟰-⟿⤀-⥿]"  # arrows
+    r"|[★☆●○◆◇■□▲△▼▽※＊*]"                        # decorative symbols / asterisks
+    r"|[!！]"                                        # exclamation marks
+    r"|[…‥]"                                        # ellipses
+    r"|[｡-ﾟ]"                              # half-width katakana
+    r"|[\U0001F000-\U0001FAFF☀-➿]"        # emoji / dingbats
+)
+
+
+def sanitize_ad_text(text: str) -> str:
+    """Strip characters that are not allowed in ad text (added 2026-08-03).
+
+    Banned characters become a space, then spaces are collapsed -- deleting them
+    outright would glue numbers together ("80→85万円" -> "8085万円").
+    Repeated punctuation and dashes are collapsed too; repetition is itself a
+    disapproval reason.
+    """
+    if not text:
+        return ""
+    t = _AD_TEXT_BANNED.sub(" ", text)
+    t = re.sub(r"([。、，,.？?])\1+", r"\1", t)
+    t = re.sub(r"([ー－—–\-]){2,}", r"\1", t)
+    t = re.sub(r"[ 　]+", " ", t).strip()
+    return t
+
+
 def build_rsa_headlines(article: dict, keywords: list[str]) -> list[str]:
     """
     Build RSA headlines from article title, tags, and keywords.
     Truncates to HEADLINE_MAX_WIDTH (30 full-width char equivalents).
+    Symbols are stripped by sanitize_ad_text() *before* truncation -- doing it
+    the other way round leaves them in.
     """
     headlines = []
 
     # Headline 1: article title (intended for pin position 1)
-    title_truncated = truncate_to_width(article["title"], HEADLINE_MAX_WIDTH)
+    title_truncated = truncate_to_width(sanitize_ad_text(article["title"]), HEADLINE_MAX_WIDTH)
     if title_truncated:
         headlines.append(title_truncated)
 
@@ -413,7 +448,7 @@ def build_rsa_headlines(article: dict, keywords: list[str]) -> list[str]:
     for kw in keywords:
         if len(headlines) >= HEADLINE_MAX_COUNT:
             break
-        h = truncate_to_width(kw, HEADLINE_MAX_WIDTH)
+        h = truncate_to_width(sanitize_ad_text(kw), HEADLINE_MAX_WIDTH)
         if h and h not in headlines:
             headlines.append(h)
 
@@ -475,10 +510,10 @@ def build_rsa_descriptions(article: dict) -> list[str]:
     """Build RSA description texts (up to 4)"""
     descriptions = []
 
-    # Description 1: generated from summary
+    # Description 1: generated from summary (symbols stripped before truncation)
     summary = article.get("summary", "")
     if summary:
-        desc = truncate_to_width(summary, DESCRIPTION_MAX_WIDTH)
+        desc = truncate_to_width(sanitize_ad_text(summary), DESCRIPTION_MAX_WIDTH)
         if desc:
             descriptions.append(desc)
 
