@@ -3,6 +3,7 @@
 Search query report analysis script
 Fetches actual search terms from search_term_view and scores negative keyword candidates.
 
+- Covers every monitored campaign (config.CAMPAIGN_NAMES); narrow with --campaign
 - Proposal only (no automatic addition unless --execute is specified)
 - --auto-execute: automatically excludes high-confidence candidates with score>=7
   (intended for automated calls from the monitoring script)
@@ -35,7 +36,7 @@ from google.ads.googleads.errors import GoogleAdsException
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
-from config import CAMPAIGN_NAME, CUSTOMER_ID
+from config import CAMPAIGN_NAMES, CUSTOMER_ID
 from ads_common.constants import MAX_AUTO_EXCLUDE_PER_RUN
 from ads_common.gaql import validate_gaql_value
 
@@ -158,14 +159,35 @@ def build_date_range(days: int) -> tuple[str, str]:
     return str(start), str(end)
 
 
-def fetch_search_terms(client, start_date: str, end_date: str) -> list[dict]:
+def fetch_search_terms(client, start_date: str, end_date: str,
+                       campaign_names: list[str] | None = None) -> list[dict]:
+    """Fetch search terms for every monitored campaign.
+
+    Until 2026-08-03 this was pinned to a single CAMPAIGN_NAME. That one
+    campaign accounted for 0.6% of account impressions, so the campaign that
+    was actually dragging account CTR down (79% of impressions) never reached
+    the negative-keyword automation. Iterate over all monitored campaigns.
+    """
+    targets = campaign_names if campaign_names is not None else CAMPAIGN_NAMES
     ga_service = client.get_service("GoogleAdsService")
-    query = build_search_term_query(CAMPAIGN_NAME, start_date, end_date)
-    try:
-        response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
-        rows = []
+    rows: list[dict] = []
+    failed: list[str] = []
+
+    for campaign_name in targets:
+        query = build_search_term_query(campaign_name, start_date, end_date)
+        try:
+            response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
+        except GoogleAdsException as ex:
+            logger.error("Google Ads API error (%s): %s", campaign_name, ex.error.code().name)
+            for error in ex.failure.errors:
+                logger.error("  %s", error.message)
+            failed.append(campaign_name)
+            continue
+
+        before = len(rows)
         for row in response:
             rows.append({
+                "campaign": campaign_name,
                 "search_term": row.search_term_view.search_term,
                 "status": row.search_term_view.status.name,  # ADDED/EXCLUDED/NONE
                 "ad_group": row.ad_group.name,
@@ -175,13 +197,24 @@ def fetch_search_terms(client, start_date: str, end_date: str) -> list[dict]:
                 "cost_micros": row.metrics.cost_micros,
                 "conversions": row.metrics.conversions,
             })
-        logger.info("Search terms fetched: %d rows (%s to %s)", len(rows), start_date, end_date)
-        return rows
-    except GoogleAdsException as ex:
-        logger.error("Google Ads API error: %s", ex.error.code().name)
-        for error in ex.failure.errors:
-            logger.error("  %s", error.message)
+        logger.info("Search terms fetched: %s = %d rows", campaign_name, len(rows) - before)
+
+    # Only abort when every campaign failed. A partial failure keeps going but
+    # must always be surfaced -- never degrade silently to a narrower scope.
+    if failed:
+        logger.warning(
+            "Campaigns whose search terms could not be fetched: %d / %d (%s)",
+            len(failed), len(targets), ", ".join(failed),
+        )
+    if len(failed) == len(targets):
+        logger.error("Failed to fetch search terms for every campaign")
         sys.exit(1)
+
+    logger.info(
+        "Search terms fetched, total: %d rows (%s to %s / %d campaigns)",
+        len(rows), start_date, end_date, len(targets) - len(failed),
+    )
+    return rows
 
 
 # ================================================================
@@ -242,13 +275,29 @@ def print_report(rows: list[dict], start_date: str, end_date: str) -> None:
     candidates = [r for r in rows if r["is_candidate"]]
     high = [r for r in rows if r["is_high_priority"]]
 
+    covered = sorted({r.get("campaign", "(unknown)") for r in rows})
+
     print("=" * 70)
     print(f"Search Query Analysis Report ({start_date} to {end_date})")
-    print(f"  Campaign: {CAMPAIGN_NAME}")
+    print(f"  Campaigns covered: {len(covered)} / {len(CAMPAIGN_NAMES)}")
     print(f"  Total queries: {len(rows)}")
     print(f"  Exclusion candidates (score>={SCORE_CANDIDATE}): {len(candidates)}")
     print(f"  High priority (score>={SCORE_HIGH}): {len(high)}")
     print("=" * 70)
+
+    # Per-campaign breakdown, so wasted spend is visible on one screen.
+    print(f"\n[Per campaign]\n{'Campaign':<32} {'queries':>8} {'imp':>8} {'click':>6} {'CTR':>7} {'cand':>5}")
+    print("-" * 70)
+    for name in CAMPAIGN_NAMES:
+        crows = [r for r in rows if r.get("campaign") == name]
+        if not crows:
+            print(f"{name:<32} {'-':>8} {'-':>8} {'-':>6} {'-':>7} {'-':>5}")
+            continue
+        imp = sum(r["impressions"] for r in crows)
+        clk = sum(r["clicks"] for r in crows)
+        cand = sum(1 for r in crows if r["is_candidate"])
+        ctr = clk / imp * 100 if imp else 0.0
+        print(f"{name:<32} {len(crows):>8} {imp:>8} {clk:>6} {ctr:>6.2f}% {cand:>5}")
 
     if not candidates:
         print("\nNo exclusion candidates. Account quality looks good.")
@@ -343,6 +392,7 @@ def print_keyword_suggestions(suggestions: list[dict]) -> None:
 
 BQ_SCHEMA = [
     bigquery.SchemaField("report_date", "DATE"),
+    bigquery.SchemaField("campaign", "STRING"),
     bigquery.SchemaField("search_term", "STRING"),
     bigquery.SchemaField("status", "STRING"),
     bigquery.SchemaField("ad_group", "STRING"),
@@ -420,7 +470,14 @@ def save_to_bigquery(rows: list[dict], start_date: str, end_date: str, days: int
     # Create table if it does not exist
     table_ref = bq_client.dataset(BQ_DATASET_ID, project=BQ_PROJECT_ID).table(BQ_TABLE_ID)
     try:
-        bq_client.get_table(table_ref)
+        table = bq_client.get_table(table_ref)
+        # The campaign column was added when this script went account-wide
+        # (2026-08-03). Existing tables predate it, so add it once. A schema
+        # update is a metadata operation and does not scan any data.
+        if not any(f.name == "campaign" for f in table.schema):
+            table.schema = list(table.schema) + [bigquery.SchemaField("campaign", "STRING")]
+            bq_client.update_table(table, ["schema"])
+            logger.info("Added campaign column to BQ table: %s", BQ_TABLE_FULL)
     except NotFound:
         table = bigquery.Table(table_ref, schema=BQ_SCHEMA)
         table.time_partitioning = bigquery.TimePartitioning(field="report_date")
@@ -437,6 +494,7 @@ def save_to_bigquery(rows: list[dict], start_date: str, end_date: str, days: int
     for r in rows:
         bq_rows.append({
             "report_date": report_date,
+            "campaign": r.get("campaign", ""),
             "search_term": r["search_term"],
             "status": r["status"],
             "ad_group": r["ad_group"],
@@ -481,6 +539,7 @@ def save_to_bigquery(rows: list[dict], start_date: str, end_date: str, days: int
             ON T.report_date = S.report_date
                AND T.search_term = S.search_term
                AND T.ad_group = S.ad_group
+               AND IFNULL(T.campaign, '') = IFNULL(S.campaign, '')
             WHEN MATCHED THEN UPDATE SET
                 T.status = S.status,
                 T.impressions = S.impressions,
@@ -494,11 +553,11 @@ def save_to_bigquery(rows: list[dict], start_date: str, end_date: str, days: int
                 T.analysis_days = S.analysis_days,
                 T.created_at = S.created_at
             WHEN NOT MATCHED THEN INSERT (
-                report_date, search_term, status, ad_group,
+                report_date, campaign, search_term, status, ad_group,
                 impressions, clicks, ctr, cost_micros,
                 conversions, score, is_candidate, is_high_priority, analysis_days, created_at
             ) VALUES (
-                S.report_date, S.search_term, S.status, S.ad_group,
+                S.report_date, S.campaign, S.search_term, S.status, S.ad_group,
                 S.impressions, S.clicks, S.ctr, S.cost_micros,
                 S.conversions, S.score, S.is_candidate, S.is_high_priority, S.analysis_days, S.created_at
             )
@@ -517,8 +576,9 @@ def save_to_bigquery(rows: list[dict], start_date: str, end_date: str, days: int
         cleanup_query = f"""
             DELETE FROM `{BQ_TABLE_FULL}`
             WHERE report_date = @report_date
-              AND STRUCT(search_term, ad_group) NOT IN (
-                  SELECT STRUCT(search_term, ad_group) FROM `{tmp_table_full}`
+              AND STRUCT(IFNULL(campaign, ''), search_term, ad_group) NOT IN (
+                  SELECT STRUCT(IFNULL(campaign, ''), search_term, ad_group)
+                  FROM `{tmp_table_full}`
               )
         """
         cleanup_config = bigquery.QueryJobConfig(
@@ -627,25 +687,42 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
         print("\nNo high-priority exclusion candidates (status=NONE). Nothing added.")
         return 0
 
-    # Get campaign resource name
     ga_service = client.get_service("GoogleAdsService")
-    query = _build_campaign_id_query(CAMPAIGN_NAME)
-    try:
-        response = ga_service.search(customer_id=CUSTOMER_ID, query=query)
-        campaign_resource = None
-        for row in response:
-            campaign_resource = row.campaign.resource_name
-            break
-        if not campaign_resource:
-            logger.error("Campaign not found: %s", CAMPAIGN_NAME)
-            return 0
-    except GoogleAdsException as ex:
-        logger.error("Campaign fetch failed: %s", ex.error.code().name)
-        return 0
+
+    # Exclude the term in the campaign it actually appeared in. Sending every
+    # term to one campaign (the old single-campaign assumption) would block
+    # traffic in campaigns that never served the term.
+    resource_cache: dict[str, str] = {}
+
+    def resolve_campaign(name: str) -> str | None:
+        if name in resource_cache:
+            return resource_cache[name]
+        try:
+            response = ga_service.search(
+                customer_id=CUSTOMER_ID, query=_build_campaign_id_query(name))
+            for row in response:
+                resource_cache[name] = row.campaign.resource_name
+                return resource_cache[name]
+        except GoogleAdsException as ex:
+            logger.error("Campaign fetch failed (%s): %s", name, ex.error.code().name)
+            return None
+        logger.error("Campaign not found: %s", name)
+        return None
 
     criterion_service = client.get_service("CampaignCriterionService")
     operations = []
+    resolved_targets = []   # kept 1:1 with operations for partial_failure index mapping
+    skipped_unresolved = 0
     for r in targets:
+        campaign_name = r.get("campaign")
+        if not campaign_name:
+            logger.warning("[SKIP] no campaign on row, cannot exclude: %s", r["search_term"])
+            skipped_unresolved += 1
+            continue
+        campaign_resource = resolve_campaign(campaign_name)
+        if not campaign_resource:
+            skipped_unresolved += 1
+            continue
         op = client.get_type("CampaignCriterionOperation")
         criterion = op.create
         criterion.campaign = campaign_resource
@@ -653,10 +730,19 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
         criterion.keyword.text = r["search_term"]
         criterion.keyword.match_type = client.enums.KeywordMatchTypeEnum.EXACT
         operations.append(op)
+        resolved_targets.append(r)
+
+    if not operations:
+        logger.error("No negative keyword could be added (campaign resolution failed: %d)",
+                     skipped_unresolved)
+        return 0
+
+    targets = resolved_targets
 
     print(f"\nAdding the following {len(targets)} items as negative KWs (EXACT match):")
     for r in targets:
-        print(f"  [{r['search_term']}] imp={r['impressions']} CTR={r['ctr']*100:.1f}% score={r['score']}")
+        print(f"  [{r['campaign']}] [{r['search_term']}] imp={r['impressions']}"
+              f" CTR={r['ctr']*100:.1f}% score={r['score']}")
 
     try:
         result = criterion_service.mutate_campaign_criteria(
@@ -703,12 +789,13 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
 # Main
 # ================================================================
 
-def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bool = False) -> list[dict]:
+def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bool = False,
+        campaigns: list[str] | None = None) -> list[dict]:
     """Run analysis and return list of scored rows."""
     start_date, end_date = build_date_range(days)
 
     client = GoogleAdsClient.load_from_storage(str(YAML_PATH))
-    rows = fetch_search_terms(client, start_date, end_date)
+    rows = fetch_search_terms(client, start_date, end_date, campaign_names=campaigns)
 
     if not rows:
         print("No search query data (no impressions in the measurement period).")
@@ -757,13 +844,22 @@ def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bo
             if r["score"] >= SCORE_AUTO_EXECUTE and r["status"] == "NONE"
         ]
         if auto_targets:
-            if len(auto_targets) > MAX_AUTO_EXCLUDE_PER_RUN:
-                logger.warning(
-                    "Auto-exclude candidates %d exceed limit %d. Running top %d only; remaining require manual review",
-                    len(auto_targets), MAX_AUTO_EXCLUDE_PER_RUN, MAX_AUTO_EXCLUDE_PER_RUN,
-                )
-                auto_targets = sorted(auto_targets, key=lambda r: r["score"], reverse=True)[:MAX_AUTO_EXCLUDE_PER_RUN]
-            logger.info("Auto-exclude: automatically adding %d items with score>=%d", len(auto_targets), SCORE_AUTO_EXECUTE)
+            # The safety cap counts per campaign. A single account-wide cap lets
+            # small campaigns eat the quota of the large one, so the wasted
+            # impressions in the biggest campaign never get cut.
+            capped: list[dict] = []
+            for name in {r.get("campaign") for r in auto_targets}:
+                per = [r for r in auto_targets if r.get("campaign") == name]
+                if len(per) > MAX_AUTO_EXCLUDE_PER_RUN:
+                    logger.warning(
+                        "Auto-exclude %s: %d candidates exceed limit %d. Running top %d; rest carried to next run",
+                        name, len(per), MAX_AUTO_EXCLUDE_PER_RUN, MAX_AUTO_EXCLUDE_PER_RUN,
+                    )
+                    per = sorted(per, key=lambda r: (-r["score"], -r["impressions"]))[:MAX_AUTO_EXCLUDE_PER_RUN]
+                capped.extend(per)
+            auto_targets = sorted(capped, key=lambda r: (-r["score"], -r["impressions"]))
+            logger.info("Auto-exclude: automatically adding %d items with score>=%d",
+                        len(auto_targets), SCORE_AUTO_EXECUTE)
             # Set is_high_priority=True to pass the add_negative_keywords filter
             auto_rows = [dict(r, is_high_priority=True) for r in auto_targets]
             added = add_negative_keywords(client, auto_rows)
@@ -812,6 +908,16 @@ Usage examples:
         ),
     )
     parser.add_argument("--discord", action="store_true", help="Send Discord notification")
+    parser.add_argument(
+        "--campaign",
+        action="append",
+        choices=CAMPAIGN_NAMES,
+        metavar="NAME",
+        help=(
+            "Limit analysis to specific campaigns (repeatable). "
+            "Defaults to every monitored campaign."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -823,6 +929,7 @@ def main() -> None:
         execute=args.execute,
         discord=args.discord,
         auto_execute=args.auto_execute,
+        campaigns=args.campaign,
     )
 
 
