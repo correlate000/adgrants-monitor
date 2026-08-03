@@ -506,6 +506,47 @@ def build_rsa_headlines(article: dict, keywords: list[str]) -> list[str]:
     return headlines[:HEADLINE_MAX_COUNT]
 
 
+# Landing page reachability gate (added 2026-08-03)
+# Pushing an article fires this sync immediately, but the site deploy finishes
+# 2-5 minutes later. Creating the ad in that window makes Google's crawler hit a
+# 404 and the ad is disapproved for "Destination not working" -- 6 fresh articles
+# were disapproved that way on 2026-08-03. Wait for the deploy before advertising.
+LANDING_PAGE_MAX_WAIT_SEC = 360   # covers a typical 2-5 minute deploy
+LANDING_PAGE_POLL_SEC = 20
+
+
+def wait_for_landing_page(url: str, max_wait: int = LANDING_PAGE_MAX_WAIT_SEC) -> tuple[bool, int]:
+    """Wait until the landing page answers 2xx. Returns (reachable, last status).
+
+    Callers must skip ad creation when this returns False -- shipping an ad that
+    points at a 404 gets it disapproved. Without httpx the check is skipped and
+    True is returned, preserving the previous behaviour.
+    """
+    if not HTTPX_AVAILABLE:
+        return True, 0
+    import time
+    deadline = time.monotonic() + max_wait
+    last = 0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            r = httpx.get(url, follow_redirects=True, timeout=20.0)
+            last = r.status_code
+            if 200 <= last < 300:
+                if attempt > 1:
+                    print(f"  [OK] Landing page is live (attempt {attempt}): {url}")
+                return True, last
+        except Exception as e:  # noqa: BLE001 -- a failed probe must not stop the sync
+            last = 0
+            print(f"  [WARN] Landing page probe failed (attempt {attempt}): {e}", file=sys.stderr)
+        if time.monotonic() + LANDING_PAGE_POLL_SEC >= deadline:
+            return False, last
+        print(f"  ... Landing page not live yet (HTTP {last});"
+              f" retrying in {LANDING_PAGE_POLL_SEC}s: {url}")
+        time.sleep(LANDING_PAGE_POLL_SEC)
+
+
 def build_rsa_descriptions(article: dict) -> list[str]:
     """Build RSA description texts (up to 4)"""
     descriptions = []
@@ -1049,6 +1090,22 @@ def sync_article(slug: str, dry_run: bool, force: bool,
             monitor_paused=monitor_paused, campaign_name=CAMPAIGN_NAME,
         )
         kw_added, kw_rejected = sync_keywords(client, svc, ad_group_resource, keywords)
+
+        # Wait for the landing page to go live. Shipping an ad while the deploy is
+        # still running gets it disapproved for "Destination not working".
+        reachable, http_code = wait_for_landing_page(final_url)
+        if not reachable:
+            msg = (f"Landing page is not live, so no ad was created "
+                   f"(HTTP {http_code}): {final_url}")
+            print(f"  [WARN] {msg}", file=sys.stderr)
+            send_discord(
+                title=f"[WARN] Ad creation skipped: {slug}",
+                description=msg,
+                severity="warning",
+                fields={"article": slug, "landing page": final_url, "status": str(http_code)},
+            )
+            return {"slug": slug, "success": False, "message": msg,
+                    "kw_added": kw_added, "rsa": "skipped_unreachable"}
 
         # Create RSA (skip on policy violation and continue; CREATE-first design preserves existing RSA)
         rsa_action = "skipped"
