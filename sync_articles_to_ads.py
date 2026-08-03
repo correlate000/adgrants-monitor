@@ -457,6 +457,56 @@ def _brackets_balanced(s: str) -> bool:
     return all(s.count(o) == s.count(c) for o, c in _BRACKET_PAIRS)
 
 
+# A headline ending on a particle is cut mid-sentence (added 2026-08-03)
+#   "消滅可能性744自治体の共通点を"  <- ends on を, promises a continuation
+#   "クレーム1本で2,100食が消えた日" <- ends on a noun, reads on its own
+# Dropping every title without punctuation loses the second kind too, so the
+# ending is inspected instead.
+_TRAILING_PARTICLES = (
+    "を", "が", "は", "に", "の", "へ", "と", "で", "も", "や", "から", "まで",
+    "より", "など", "とは", "には", "では", "ため", "こと", "する", "した", "れる",
+)
+
+
+def _is_kanji(c: str) -> bool:
+    return "一" <= c <= "鿿" or "㐀" <= c <= "䶿"
+
+
+def _is_katakana(c: str) -> bool:
+    return "゠" <= c <= "ヿ" or "ㇰ" <= c <= "ㇿ"
+
+
+def _is_readable_ending(cand: str, rest: str) -> bool:
+    """Whether a width-truncated candidate reads on its own.
+
+    cand: the truncated text / rest: what follows it in the source.
+
+    Japanese has no spaces between words, so word boundaries are approximated
+    from script transitions and particles. It is not exact, but it catches the
+    obvious mid-word cuts ("〜の共通点を", "参加型デザインの系(譜)").
+    """
+    if not cand or display_width(cand) < HEADLINE_MIN_WIDTH:
+        return False
+    if not _brackets_balanced(cand):
+        return False
+    if cand[-1] in "：:、。，,—–〜~ 　":
+        return False
+    if any(cand.endswith(p) for p in _TRAILING_PARTICLES):
+        return False
+    if not rest:
+        return True
+    last, nxt = cand[-1], rest[0]
+    if last.isdigit() and (nxt.isdigit() or nxt in ",，."):
+        return False
+    if last.isascii() and last.isalpha() and nxt.isalpha():
+        return False
+    if _is_kanji(last) and _is_kanji(nxt):        # mid compound noun
+        return False
+    if _is_katakana(last) and _is_katakana(nxt):  # mid loanword
+        return False
+    return True
+
+
 def headline_from_title(title: str, max_width: int = HEADLINE_MAX_WIDTH) -> str:
     """Build a headline from the article title without cutting mid-word.
 
@@ -475,22 +525,27 @@ def headline_from_title(title: str, max_width: int = HEADLINE_MAX_WIDTH) -> str:
         return s
 
     best = ""
+    fallback = ""   # used when the title has no punctuation to cut at
     width = 0
     for i, c in enumerate(s):
         w = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
         if width + w > max_width:
             break
         width += w
+        cand = s[:i + 1]
+        if _is_readable_ending(cand, s[i + 1:]):
+            fallback = cand
         is_cut = c in _HEADLINE_CUT_AFTER or (
             i + 1 < len(s) and s[i + 1] in _HEADLINE_CUT_BEFORE
         )
         if not is_cut:
             continue
-        cand = s[:i + 1].rstrip("：:、。，,—–〜~ 　")
-        if _brackets_balanced(cand):
-            best = cand
+        trimmed = cand.rstrip("：:、。，,—–〜~ 　")
+        if _brackets_balanced(trimmed):
+            best = trimmed
 
-    return best if display_width(best) >= HEADLINE_MIN_WIDTH else ""
+    chosen = best if display_width(best) >= HEADLINE_MIN_WIDTH else fallback
+    return chosen if display_width(chosen) >= HEADLINE_MIN_WIDTH else ""
 
 
 def build_rsa_headlines(article: dict, keywords: list[str]) -> list[str]:
