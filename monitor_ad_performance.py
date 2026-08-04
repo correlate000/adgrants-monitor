@@ -167,6 +167,13 @@ load_dotenv(SCRIPT_DIR / ".env")
 DISCORD_WEBHOOK_AD_ALERT = os.environ.get("DISCORD_WEBHOOK_AD_ALERT", "")
 DISCORD_WEBHOOK_DAILY_REPORT = os.environ.get("DISCORD_WEBHOOK_DAILY_REPORT", "")
 
+# Discord per-message limits (confirmed against the official docs on 2026-08-04)
+# https://docs.discord.com/developers/resources/webhook - "array of up to 10 embed objects"
+# https://docs.discord.com/developers/resources/message#embed-object-embed-limits - 6,000 chars total
+# Exceeding either returns 400 Bad Request and **nothing is delivered**.
+DISCORD_MAX_EMBEDS = 10
+DISCORD_MAX_EMBED_CHARS = 6000
+
 
 # ===== GAQL Queries =====
 
@@ -1258,6 +1265,7 @@ def save_to_bigquery(
     end_date: str,
     alerts: list[dict],
     paused_log: list[dict],
+    failure_reasons: list[str] | None = None,
 ) -> bool:
     """Save performance data to BigQuery.
 
@@ -1275,12 +1283,16 @@ def save_to_bigquery(
     """
     if not SA_KEY_PATH.exists():
         logger.warning("SA key file not found: %s. Skipping BQ save.", SA_KEY_PATH)
+        if failure_reasons is not None:
+            failure_reasons.append("the service account key file is missing")
         return False
 
     try:
         bq_client = bigquery.Client.from_service_account_json(str(SA_KEY_PATH))
     except Exception as e:
         logger.warning("Failed to initialize BigQuery client: %s", e)
+        if failure_reasons is not None:
+            failure_reasons.append(f"could not connect: {classify_bq_failure(e)}")
         return False
 
     account_id = CUSTOMER_ID
@@ -1366,9 +1378,13 @@ def save_to_bigquery(
 
     except GoogleAdsException as ex:
         logger.warning("ad_campaign_daily Google Ads API error: %s", ex)
+        if failure_reasons is not None:
+            failure_reasons.append(f"ad_campaign_daily: Google Ads API error ({str(ex)[:80]})")
         bq_save_ok = False
     except Exception as e:
         logger.warning("Failed to save ad_campaign_daily: %s", e)
+        if failure_reasons is not None:
+            failure_reasons.append(f"ad_campaign_daily: {classify_bq_failure(e)}")
         bq_save_ok = False
 
     # ---------- ad_keyword_performance (all campaigns, previous day snapshot) ----------
@@ -1456,9 +1472,13 @@ def save_to_bigquery(
 
     except GoogleAdsException as ex:
         logger.warning("ad_keyword_performance Google Ads API error: %s", ex)
+        if failure_reasons is not None:
+            failure_reasons.append(f"ad_keyword_performance: Google Ads API error ({str(ex)[:80]})")
         bq_save_ok = False
     except Exception as e:
         logger.warning("Failed to save ad_keyword_performance: %s", e)
+        if failure_reasons is not None:
+            failure_reasons.append(f"ad_keyword_performance: {classify_bq_failure(e)}")
         bq_save_ok = False
 
     # ---------- ad_actions_log ----------
@@ -1497,6 +1517,8 @@ def save_to_bigquery(
             errors = bq_client.insert_rows_json(bq_table_action, rows_action)
             if errors:
                 logger.warning("ad_actions_log INSERT error: %s", errors)
+                if failure_reasons is not None:
+                    failure_reasons.append(f"ad_actions_log: write rejected ({str(errors)[:80]})")
                 bq_save_ok = False
             else:
                 print(f"[BQ] ad_actions_log: saved {len(rows_action)} rows")
@@ -1510,16 +1532,139 @@ def save_to_bigquery(
 
 # ===== Discord Notifications =====
 
-def send_discord_notification(webhook_url: str, content: str, embeds: list[dict]) -> None:
-    """Send message to Discord Webhook. On error, log to stderr and skip."""
+def _embed_char_count(embed: dict) -> int:
+    """Count only the characters Discord counts toward the 6,000 limit.
+
+    Matches the official list (title / description / field name / field value /
+    footer text / author name). color and timestamp do not count.
+    """
+    total = len(embed.get("title") or "") + len(embed.get("description") or "")
+    for field in embed.get("fields") or []:
+        total += len(field.get("name") or "") + len(field.get("value") or "")
+    total += len((embed.get("footer") or {}).get("text") or "")
+    total += len((embed.get("author") or {}).get("name") or "")
+    return total
+
+
+def fit_embeds_to_discord_limits(embeds: list[dict]) -> tuple[list[dict], int]:
+    """Return only the embeds that fit in one Discord message.
+
+    Two official limits apply
+    (https://docs.discord.com/developers/resources/webhook and
+    message#embed-object-embed-limits):
+
+      - at most **10 embeds** per message
+      - at most **6,000 characters** across all embeds
+
+    Exceeding either returns 400 Bad Request and **nothing is delivered**.
+    From 2026-07-05 to 2026-08-04 every ad alert was lost this way: the script
+    packed 14-70 alerts into a single message.
+
+    Returns:
+        (embeds to send, number dropped)
+    """
+    kept: list[dict] = []
+    used_chars = 0
+    for embed in embeds:
+        if len(kept) >= DISCORD_MAX_EMBEDS:
+            break
+        size = _embed_char_count(embed)
+        if used_chars + size > DISCORD_MAX_EMBED_CHARS:
+            break
+        kept.append(embed)
+        used_chars += size
+    return kept, len(embeds) - len(kept)
+
+
+def send_discord_notification(webhook_url: str, content: str, embeds: list[dict]) -> bool:
+    """Send message to Discord Webhook.
+
+    Trims to the per-message limits and **states how many were dropped** in the
+    message body, so truncation is never silent.
+
+    Returns:
+        bool: True when delivered. False when unset or the send failed.
+    """
     if not webhook_url:
-        return
-    payload = {"content": content, "embeds": embeds}
+        return False
+    kept, dropped = fit_embeds_to_discord_limits(embeds)
+    if dropped > 0:
+        notice = (f"Showing {len(kept)} of {len(embeds)} alerts (Discord per-message limit). "
+                  "The full list is in the report and the escalation email.")
+        content = f"{content}\n{notice}".strip() if content else notice
+        logger.info("Discord: sent %d of %d embeds (%d dropped by limit)", len(kept), len(embeds), dropped)
+    payload = {"content": content, "embeds": kept}
     try:
         response = httpx.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
+        return True
     except Exception as e:
         logger.warning("Failed to send Discord notification: %s", e)
+        return False
+
+
+# Human-readable heading per category, used in the CRITICAL email subject
+CRITICAL_SUBJECT_LABELS: dict[str, str] = {
+    "account_ctr": "account CTR below the bar",
+    "account_ctr_early_warning": "account CTR close to the bar",
+    "daily_ctr_streak": "daily CTR below the bar repeatedly",
+    "monthly_pace": "monthly CTR pacing below the bar",
+    "campaign": "campaign anomaly",
+    "ad_group_ctr": "ad group CTR is low",
+    "ad_group_impression_surge": "ad group impressions surged",
+    "ad_group_pause_deferred": "ad group auto-pause deferred",
+    "quality_score": "quality score below the bar",
+    "rsa_generic_template": "ad copy still on the template",
+    "rsa_broken_headline": "broken ad headline",
+    "rsa_duplicate": "duplicate ad copy",
+    "bq_save_outage": "BigQuery save failing repeatedly",
+    "alert_channel_down": "Discord alerts not delivered",
+}
+
+
+def build_critical_email_subject(critical_alerts: list[dict]) -> str:
+    """Build the CRITICAL email subject from what is actually firing.
+
+    Until 2026-08-04 the subject was always `CRITICAL: account CTR {value} (5% required)`.
+    When the real cause was a BigQuery outage the subject still showed CTR, so on a day
+    with a healthy 7.30% CTR the inbox got **"CRITICAL: account CTR 7.30%"** - a subject
+    that contradicts itself and points the reader at the wrong problem.
+    """
+    if not critical_alerts:
+        return "[AdGrants] CRITICAL"
+    labels: list[str] = []
+    for alert in critical_alerts:
+        label = CRITICAL_SUBJECT_LABELS.get(alert.get("category", ""))
+        if label and label not in labels:
+            labels.append(label)
+    if not labels:
+        labels = ["see email body"]
+    head = " / ".join(labels[:2])
+    rest = len(labels) - 2
+    if rest > 0:
+        head += f" +{rest} more"
+    return f"[AdGrants] CRITICAL: {head}"
+
+
+def classify_bq_failure(error: Exception) -> str:
+    """Turn a BigQuery save failure into a one-line cause the reader can act on.
+
+    Hard-coding "typical cause: disabled service account" points the reader at the
+    wrong thing whenever the real cause is something else (a scan quota, for example).
+    """
+    text = str(error)
+    if "Custom quota exceeded" in text or "quota" in text.lower():
+        return ("the daily scan quota is exhausted "
+                "(raise the quota, change how the table is written, or accept the gap)")
+    if "403" in text and ("permission" in text.lower() or "denied" in text.lower()):
+        return "the service account lacks permission"
+    if "401" in text or "invalid_grant" in text or "credential" in text.lower():
+        return "the service account credentials are invalid (disabled or missing key)"
+    if "streaming buffer" in text:
+        return "the previous write has not settled yet (resolves on its own)"
+    if "Not found" in text or "404" in text:
+        return "the destination table was not found"
+    return f"unexpected error: {text[:120]}"
 
 
 def build_ad_alert_embed(
@@ -2928,6 +3073,7 @@ def main():
 
     # BigQuery save
     bq_save_ok = True
+    bq_failure_reasons: list[str] = []
     if args.save_bq:
         if not args.json_only:
             print("[INFO] Saving data to BigQuery...")
@@ -2935,6 +3081,7 @@ def main():
             client,
             start_date, end_date,
             alerts, paused_log,
+            failure_reasons=bq_failure_reasons,
         )
 
     # ----------------------------------------------------------------
@@ -2954,20 +3101,29 @@ def main():
         except OSError as e:
             logger.warning("Failed to write BQ failure counter: %s", e)
         if streak >= 3:
+            # "N runs", not "N days": since 2026-07-28 the job runs twice a day
+            # (07:00 and 19:00), so the counter and the calendar do not match.
+            reason_text = (
+                " / ".join(bq_failure_reasons)
+                if bq_failure_reasons
+                else "check the warning lines in the log"
+            )
             alerts.append({
                 "level": "CRITICAL",
                 "category": "bq_save_outage",
                 "message": (
-                    f"BigQuery data save has failed {streak} days in a row. "
-                    "Typical cause: disabled service account or missing key. "
+                    f"BigQuery data save has failed {streak} runs in a row.\n"
+                    f"Cause: {reason_text}\n"
                     "Analytics data is accumulating gaps (ad serving unaffected)."
                 ),
             })
 
     # Discord notification
     if args.discord:
-        # Send to ad alert channel if CRITICAL/WARNING alerts exist
-        critical_warnings = [a for a in alerts if a["level"] in ("CRITICAL", "WARNING")]
+        # Send to ad alert channel if CRITICAL/WARNING alerts exist.
+        # CRITICAL first, so anything dropped by the per-message limit is the milder one.
+        critical_warnings = [a for a in alerts if a["level"] == "CRITICAL"]
+        critical_warnings += [a for a in alerts if a["level"] == "WARNING"]
         if critical_warnings and DISCORD_WEBHOOK_AD_ALERT:
             alert_embeds = []
             for alert in critical_warnings:
@@ -2981,11 +3137,24 @@ def main():
                     },
                 )
                 alert_embeds.append(embed)
-            send_discord_notification(
+            alert_sent = send_discord_notification(
                 DISCORD_WEBHOOK_AD_ALERT,
                 content="",
                 embeds=alert_embeds,
             )
+            if not alert_sent:
+                # Make a dead alert channel an alert in itself. A logger warning
+                # reaches nobody, which is how alerts went missing for 30 days
+                # between 2026-07-05 and 2026-08-04.
+                alerts.append({
+                    "level": "CRITICAL",
+                    "category": "alert_channel_down",
+                    "message": (
+                        "Could not deliver to the Discord ad alert webhook. "
+                        f"Today's {len(critical_warnings)} alerts did not reach Discord. "
+                        "Check DISCORD_WEBHOOK_AD_ALERT and the response code in the log."
+                    ),
+                })
 
         # Send daily summary to daily report channel (skip if --json-only)
         if DISCORD_WEBHOOK_DAILY_REPORT:
@@ -3046,7 +3215,7 @@ def main():
             executed_pauses = len([p for p in paused_log if not p.get("dry_run")])
             lines = [
                 f"CRITICAL detected by AdGrants monitor (period: {start_date} to {end_date})",
-                f"Account CTR: {ctr_str} (Ad Grants requirement: 5%+)",
+                f"For reference - account CTR: {ctr_str} (Ad Grants requirement: 5%+)",
                 "",
                 "== CRITICAL ==",
             ]
@@ -3061,7 +3230,7 @@ def main():
                 "This email is sent once per day when CRITICAL is detected.",
             ]
             if send_alert_email(
-                subject=f"[AdGrants] CRITICAL: account CTR {ctr_str} (5% required)",
+                subject=build_critical_email_subject(critical_alerts),
                 body="\n".join(lines),
             ):
                 email_sentinel.write_text(today_mark, encoding="utf-8")
