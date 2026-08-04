@@ -174,6 +174,10 @@ DISCORD_WEBHOOK_DAILY_REPORT = os.environ.get("DISCORD_WEBHOOK_DAILY_REPORT", ""
 DISCORD_MAX_EMBEDS = 10
 DISCORD_MAX_EMBED_CHARS = 6000
 
+# How many examples of the same warning category to list in the email.
+# The rest is reported as "+N more" - never dropped silently.
+EMAIL_WARNING_SAMPLES = 3
+
 
 # ===== GAQL Queries =====
 
@@ -1665,6 +1669,96 @@ def classify_bq_failure(error: Exception) -> str:
     if "Not found" in text or "404" in text:
         return "the destination table was not found"
     return f"unexpected error: {text[:120]}"
+
+
+def _first_sentence(message: str) -> str:
+    """Take the one line used as a sample in the email.
+
+    Warnings of the same kind share a trailing explanation ("... Ad Grants requires
+    QS 3 or above. (auto-pause only at QS<=1)"), so listing three of them repeats the
+    same sentence three times. The fact lives in the first sentence; the full text
+    stays in the report.
+    """
+    head = message.splitlines()[0]
+    for terminator in ("。", ". "):
+        idx = head.find(terminator)
+        if idx != -1 and idx < len(head) - len(terminator):
+            return head[:idx + len(terminator)].rstrip()
+    return head
+
+
+def build_alert_email_body(
+    campaign: dict | None,
+    alerts: list[dict],
+    executed_pauses: int,
+    start_date: str,
+    end_date: str,
+    report_path: str = "",
+) -> str:
+    """Build the email body. This is the channel that actually gets read, so the
+    email alone has to explain the situation.
+
+    CRITICAL items are listed in full. WARNING items repeat by the dozen, so they are
+    grouped by category with a count and a few examples - and **the number omitted is
+    always stated**, never silently dropped.
+    """
+    lines = [f"Ad monitoring for {start_date} to {end_date}.", ""]
+
+    criticals = [a for a in alerts if a["level"] == "CRITICAL"]
+    if criticals:
+        lines.append("== What is happening ==")
+        for a in criticals:
+            for i, part in enumerate(a["message"].split("\n")):
+                lines.append(("  " if i == 0 else "    ") + part)
+        lines.append("")
+
+    lines.append("== Numbers ==")
+    if campaign:
+        lines.append(f"  CTR          {campaign['ctr'] * 100:.2f}% (Ad Grants requires 5%+)")
+        lines.append(f"  Impressions  {campaign['impressions']:,}")
+        lines.append(f"  Clicks       {campaign['clicks']:,}")
+        lines.append(f"  Conversions  {campaign.get('conversions', 0):.0f}")
+        lines.append(f"  Cost         ${campaign.get('cost_dollars', 0):,.2f}")
+    else:
+        lines.append("  could not be retrieved")
+    lines.append(f"  Auto-paused  {executed_pauses}")
+    lines.append("")
+
+    warnings = [a for a in alerts if a["level"] == "WARNING"]
+    if warnings:
+        grouped: dict[str, list[dict]] = {}
+        for a in warnings:
+            grouped.setdefault(a.get("category", "other"), []).append(a)
+        lines.append(f"== Worth a look ({len(warnings)}) ==")
+        for category, items in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+            label = CRITICAL_SUBJECT_LABELS.get(category, category)
+            lines.append(f"  {label}  {len(items)}")
+            for a in items[:EMAIL_WARNING_SAMPLES]:
+                lines.append(f"    - {_first_sentence(a['message'])}")
+            hidden = len(items) - EMAIL_WARNING_SAMPLES
+            if hidden > 0:
+                lines.append(f"    - +{hidden} more (full list in the report)")
+        lines.append("")
+
+    if report_path:
+        lines.append("== Full report ==")
+        lines.append(f"  {report_path}")
+        lines.append("")
+
+    lines.append("Where to act: /adgrants-optimize (Claude Code) or the Google Ads UI")
+    lines.append("Sent by monitor_ad_performance.py.")
+    return "\n".join(lines)
+
+
+def build_critical_email_fingerprint(critical_alerts: list[dict], today_mark: str) -> str:
+    """Fingerprint so a *different* problem later the same day still gets sent.
+
+    Suppressing by date alone means a problem that appears in the evening never
+    reaches the inbox if something already fired that morning. Since 2026-07-28 the
+    job runs twice a day, so that gap is reachable every single day.
+    """
+    categories = sorted({a.get("category", "") for a in critical_alerts})
+    return today_mark + "|" + ",".join(categories)
 
 
 def build_ad_alert_embed(
@@ -3198,42 +3292,37 @@ def main():
             )
 
     # ----------------------------------------------------------------
-    # CRITICAL email escalation (one per day; guards against missed Discord alerts)
+    # Email notification (the channel that actually gets read; primary since 2026-08-04)
+    # Discord delivered nothing for the 30 days from 2026-07-05 to 2026-08-04.
+    # Deduplicate on "date + set of firing CRITICAL categories", not on date alone:
+    # date alone hides a different problem appearing later the same day.
     # ----------------------------------------------------------------
     critical_alerts = [a for a in alerts if a["level"] == "CRITICAL"]
     if critical_alerts and not args.no_email and not args.json_only:
         email_sentinel = REPORTS_DIR / ".last_critical_email"
         today_mark = datetime.now(tz=JST).strftime("%Y-%m-%d")
+        fingerprint = build_critical_email_fingerprint(critical_alerts, today_mark)
         already_sent = (
             email_sentinel.exists()
-            and email_sentinel.read_text(encoding="utf-8").strip() == today_mark
+            and email_sentinel.read_text(encoding="utf-8").strip() == fingerprint
         )
         if already_sent:
-            logger.info("CRITICAL email already sent today; skipping")
+            logger.info("Same content already emailed; skipping")
         else:
-            ctr_str = f"{campaign['ctr'] * 100:.2f}%" if campaign else "-"
             executed_pauses = len([p for p in paused_log if not p.get("dry_run")])
-            lines = [
-                f"CRITICAL detected by AdGrants monitor (period: {start_date} to {end_date})",
-                f"For reference - account CTR: {ctr_str} (Ad Grants requirement: 5%+)",
-                "",
-                "== CRITICAL ==",
-            ]
-            lines += [f"- {a['message']}" for a in critical_alerts]
-            warn_alerts = [a for a in alerts if a["level"] == "WARNING"]
-            if warn_alerts:
-                lines += ["", f"== WARNING (top 5 of {len(warn_alerts)}) =="]
-                lines += [f"- {a['message']}" for a in warn_alerts[:5]]
-            lines += [
-                "",
-                f"Auto-pauses executed today: {executed_pauses}",
-                "This email is sent once per day when CRITICAL is detected.",
-            ]
+            body = build_alert_email_body(
+                campaign=campaign,
+                alerts=alerts,
+                executed_pauses=executed_pauses,
+                start_date=start_date,
+                end_date=end_date,
+                report_path=str(REPORTS_DIR / f"ads-performance-{end_date}.txt"),
+            )
             if send_alert_email(
                 subject=build_critical_email_subject(critical_alerts),
-                body="\n".join(lines),
+                body=body,
             ):
-                email_sentinel.write_text(today_mark, encoding="utf-8")
+                email_sentinel.write_text(fingerprint, encoding="utf-8")
 
     # ----------------------------------------------------------------
     # Weekly summary (auto-send every Monday)
@@ -3253,6 +3342,36 @@ def main():
             content="",
             embeds=[weekly_embed],
         )
+
+    # Send the weekly summary by email as well.
+    # In a week with no CRITICAL, warnings never reach the inbox otherwise, so this
+    # is the only regular email.
+    if should_weekly and not args.no_email and not args.json_only:
+        weekly_sentinel = REPORTS_DIR / ".last_weekly_email"
+        week_mark = datetime.now(tz=JST).strftime("%G-W%V")
+        weekly_done = (
+            weekly_sentinel.exists()
+            and weekly_sentinel.read_text(encoding="utf-8").strip() == week_mark
+        )
+        if weekly_done:
+            logger.info("Weekly summary already emailed this week; skipping")
+        else:
+            print("[INFO] Sending weekly summary by email...")
+            weekly_body = build_alert_email_body(
+                campaign=campaign,
+                alerts=alerts,
+                executed_pauses=len([p for p in paused_log if not p.get("dry_run")]),
+                start_date=start_date,
+                end_date=end_date,
+                report_path=str(REPORTS_DIR / f"ads-performance-{end_date}.txt"),
+            )
+            n_critical = len([a for a in alerts if a["level"] == "CRITICAL"])
+            state = f"{n_critical} critical" if n_critical else "nothing critical"
+            if send_alert_email(
+                subject=f"[AdGrants] Weekly summary ({start_date} to {end_date}, {state})",
+                body=weekly_body,
+            ):
+                weekly_sentinel.write_text(week_mark, encoding="utf-8")
 
     # ----------------------------------------------------------------
     # Search term analysis (--analyze-search-terms or auto every Monday)
