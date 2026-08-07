@@ -695,10 +695,32 @@ def send_discord_notification(
 # Negative KW addition (--execute)
 # ================================================================
 
+# Returned by add_negative_keywords when the outcome could not be determined
+ADD_RESULT_UNKNOWN = -1
+
+
+def _google_ads_failure_type(client):
+    """Return the raw protobuf GoogleAdsFailure used to read partial_failure details.
+
+    `google.ads.googleads.errors` only exposes GoogleAdsException; GoogleAdsFailure
+    lives in the versioned types (v*.errors.types.errors). Pull the versioned type
+    through the client and unwrap the proto-plus wrapper (.meta.pb).
+    Returns None when the type cannot be resolved, so the caller does not report
+    a success count it has not verified.
+    """
+    try:
+        return type(client.get_type("GoogleAdsFailure")).meta.pb
+    except Exception as e:  # library upgrade changed the name or the accessor
+        logger.error("Cannot resolve the GoogleAdsFailure type: %s", e)
+        return None
+
+
 def add_negative_keywords(client, rows: list[dict]) -> int:
     """
     Add score>=SCORE_HIGH + status=NONE candidates as negative keywords.
-    Returns the number of keywords added.
+
+    Returns the number of keywords added, or ADD_RESULT_UNKNOWN (-1) when the
+    partial_failure breakdown could not be parsed. Never guess the count.
     """
     targets = [r for r in rows if r["is_high_priority"] and r["status"] == "NONE"]
     if not targets:
@@ -774,16 +796,17 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
         # NOTE: operations and targets are assumed to share the same index order
         failed_indices: set[int] = set()
         if result.partial_failure_error and result.partial_failure_error.code != 0:
-            try:
-                from google.ads.googleads import errors as googleads_errors
-            except ImportError:
-                logger.warning("Failed to import google-ads errors module. Skipping partial_failure detail analysis.")
-                added = len(operations)  # Conservatively report all as success when details are unavailable
-                logger.info("Negative KW add complete: %d (partial_failure detail analysis skipped)", added)
-                return added
+            failure_type = _google_ads_failure_type(client)
+            if failure_type is None:
+                # We do not know which operations landed. Naming a success count
+                # here would report negatives as added when they are not.
+                # Return "unknown" so the caller can go read the account back.
+                logger.error(
+                    "Could not parse partial_failure. Unknown how many of %d operations "
+                    "landed; read the ad account back to confirm", len(operations))
+                return ADD_RESULT_UNKNOWN
             for detail in result.partial_failure_error.details:
-                failure = googleads_errors.GoogleAdsFailure()
-                detail.Unpack(failure)
+                failure = failure_type.FromString(detail.value)
                 for ads_error in failure.errors:
                     for field_ref in ads_error.location.field_path_elements:
                         if field_ref.field_name == "operations":
@@ -849,7 +872,10 @@ def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bo
                 print("Cancelled. No negative KWs were added.")
                 return scored_rows
         added = add_negative_keywords(client, scored_rows)
-        print(f"\n[OK] Negative KW add complete: {added} items")
+        if added == ADD_RESULT_UNKNOWN:
+            print("\n[FAIL] Cannot tell how many negative KWs landed. Read the ad account back to confirm")
+        else:
+            print(f"\n[OK] Negative KW add complete: {added} items")
     else:
         high = [r for r in scored_rows if r["is_high_priority"] and r["status"] == "NONE"]
         if high:
@@ -881,9 +907,21 @@ def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bo
             # Set is_high_priority=True to pass the add_negative_keywords filter
             auto_rows = [dict(r, is_high_priority=True) for r in auto_targets]
             added = add_negative_keywords(client, auto_rows)
-            print(f"\n[OK] Auto-exclude negative KW add complete: {added} (score>={SCORE_AUTO_EXECUTE})")
+            unknown = added == ADD_RESULT_UNKNOWN
+            if unknown:
+                print(f"\n[FAIL] Cannot tell how many auto-exclude negative KWs landed "
+                      f"({len(auto_targets)} attempted / score>={SCORE_AUTO_EXECUTE}). "
+                      f"Read the ad account back to confirm")
+            else:
+                print(f"\n[OK] Auto-exclude negative KW add complete: {added} (score>={SCORE_AUTO_EXECUTE})")
             if discord:
-                lines = [f"**Auto-exclude negative KW add** ({added} items / score>={SCORE_AUTO_EXECUTE})"]
+                head = (
+                    f"**Auto-exclude negative KW: outcome unknown** "
+                    f"({len(auto_targets)} attempted / score>={SCORE_AUTO_EXECUTE})"
+                    if unknown
+                    else f"**Auto-exclude negative KW add** ({added} items / score>={SCORE_AUTO_EXECUTE})"
+                )
+                lines = [head]
                 for t in auto_targets[:5]:
                     lines.append(f"- `{t['search_term']}` score={t['score']} imp={t['impressions']}")
                 if len(auto_targets) > 5:
