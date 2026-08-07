@@ -67,6 +67,9 @@ SCORE_HIGH = 5         # >= this -> high priority (Discord alert, --execute targ
 SCORE_AUTO_EXECUTE = 7  # >= this -> auto-exclude (with --auto-execute)
 # MAX_AUTO_EXCLUDE_PER_RUN is imported from ads_common.constants
 
+# Impression floor for the high-volume-waste bonus (see score_search_term)
+HIGH_VOLUME_WASTE_MIN_IMP = 100
+
 # ================================================================
 # Suspicious patterns (EXACT match may misfire but context should be excluded)
 # ================================================================
@@ -240,6 +243,21 @@ def score_search_term(row: dict) -> int:
 
     # clicks>=3 and CV=0 -> +2 (clicked but no conversion)
     if clicks >= 3 and conversions == 0:
+        score += 2
+
+    # imp>=HIGH_VOLUME_WASTE_MIN_IMP and CTR<3% -> +2 (impressions pile up, clicks do not)
+    #
+    # Without this bonus, SCORE_AUTO_EXECUTE (7) is only reachable through
+    # SUSPICIOUS_PATTERNS. The other bonuses are mutually exclusive and cap at
+    # 3+2+1=6 whether the term has zero clicks or several, so a term that does not
+    # appear in the pattern list can never be auto-excluded no matter how much it
+    # costs. Since the analysis covers every campaign in the account, tying the
+    # trigger to one campaign's vocabulary leaves the rest unprotected.
+    #
+    # A low CTR measured over a large number of impressions is evidence; zero clicks
+    # on ten impressions is not. Only the former goes to auto-exclusion — the rest
+    # stays in the report for a human to decide.
+    if imp >= HIGH_VOLUME_WASTE_MIN_IMP and ctr < 0.03:
         score += 2
 
     # status=NONE -> +1 (unclassified; EXCLUDED is already excluded)
