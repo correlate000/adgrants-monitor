@@ -850,7 +850,20 @@ def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bo
     print_keyword_suggestions(suggestions)
 
     if save_bq:
-        save_to_bigquery(scored_rows, start_date, end_date, days=days)
+        # Failing to record the analysis and failing to stop wasted spend are
+        # two different things. Letting the exception escape here skips every
+        # step below it — negative keyword addition and trending keyword
+        # addition both sit after this line. On a live account this ran into a
+        # BigQuery per-day query quota from 2026-07-23 onward, and the daily
+        # auto-exclusion died here every single day. The caller wraps run() in a
+        # broad except, so the log only showed "search term analysis failed" and
+        # never that the exclusion step had not run.
+        try:
+            save_to_bigquery(scored_rows, start_date, end_date, days=days)
+        except Exception as e:
+            logger.error(
+                "BigQuery save failed: %s. Nothing will be recorded, "
+                "but negative keyword addition continues", e)
 
     if discord:
         notified = send_discord_notification(scored_rows, start_date, end_date, suggestions=suggestions)
