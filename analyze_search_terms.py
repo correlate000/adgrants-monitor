@@ -698,6 +698,28 @@ def send_discord_notification(
 # Returned by add_negative_keywords when the outcome could not be determined
 ADD_RESULT_UNKNOWN = -1
 
+# Google Ads limits on a negative keyword.
+# The word cap moved from 10 to 16 in October 2019.
+# https://support.google.com/google-ads/answer/2453972
+MAX_NEGATIVE_KW_WORDS = 16
+MAX_NEGATIVE_KW_CHARS = 80
+
+
+def negative_keyword_reject_reason(term: str) -> str | None:
+    """Return why Google will reject this term, or None when it can be sent.
+
+    Filtering these out before the call matters: a term over the limit fails
+    identically on every run and stays in the candidate list forever. On a live
+    account, one 17-word term was retried on all six runs across three days,
+    each ending in "Keyword text has too many words." and zero added.
+    """
+    words = len(term.split())
+    if words > MAX_NEGATIVE_KW_WORDS:
+        return f"{words} words (limit {MAX_NEGATIVE_KW_WORDS})"
+    if len(term) > MAX_NEGATIVE_KW_CHARS:
+        return f"{len(term)} characters (limit {MAX_NEGATIVE_KW_CHARS})"
+    return None
+
 
 def _google_ads_failure_type(client):
     """Return the raw protobuf GoogleAdsFailure used to read partial_failure details.
@@ -753,7 +775,14 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
     operations = []
     resolved_targets = []   # kept 1:1 with operations for partial_failure index mapping
     skipped_unresolved = 0
+    unaddable: list[tuple[dict, str]] = []
     for r in targets:
+        reason = negative_keyword_reject_reason(r["search_term"])
+        if reason:
+            # Google will reject this every time. Sending it only repeats the
+            # same failure, so drop it here.
+            unaddable.append((r, reason))
+            continue
         campaign_name = r.get("campaign")
         if not campaign_name:
             logger.warning("[SKIP] no campaign on row, cannot exclude: %s", r["search_term"])
@@ -772,9 +801,20 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
         operations.append(op)
         resolved_targets.append(r)
 
+    if unaddable:
+        # Nothing automatic can help here. Someone has to pick a shorter phrase
+        # and add it as a phrase-match negative.
+        print(f"\n[WARN] {len(unaddable)} term(s) exceed Google's limits "
+              f"and cannot be added automatically:")
+        for r, reason in unaddable:
+            print(f"  [{r.get('campaign', '?')}] [{r['search_term']}]"
+                  f" imp={r['impressions']} CTR={r['ctr']*100:.1f}% - {reason}")
+        logger.warning("Skipped %d term(s) that exceed Google's limits", len(unaddable))
+
     if not operations:
-        logger.error("No negative keyword could be added (campaign resolution failed: %d)",
-                     skipped_unresolved)
+        logger.error(
+            "No negative keyword could be added (campaign resolution failed: %d / over limit: %d)",
+            skipped_unresolved, len(unaddable))
         return 0
 
     targets = resolved_targets
