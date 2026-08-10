@@ -378,6 +378,11 @@ def suggest_new_keywords(rows: list[dict]) -> list[dict]:
             "ctr": row["ctr"],
             "conversions": row["conversions"],
             "ad_group": row["ad_group"],
+            # Ad group names repeat across campaigns (74 duplicates on a live
+            # account), so anything that acts on a suggestion has to scope the
+            # lookup by campaign. Carry it here: a downstream step that filters
+            # on a field the producer never set silently drops every candidate.
+            "campaign": row.get("campaign"),
         })
 
     suggestions.sort(key=lambda x: (-x["ctr"], -x["impressions"]))
