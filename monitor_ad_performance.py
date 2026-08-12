@@ -864,6 +864,88 @@ def generate_alerts(
                 "quality_score": kw["quality_score"],
             })
 
+    alerts.extend(check_shadow_campaigns(ad_groups, keywords))
+
+    return alerts
+
+
+# How much of a campaign's ad groups must also live elsewhere to call it a shadow
+SHADOW_CONTAINMENT_RATIO = 0.8
+
+
+def check_shadow_campaigns(ad_groups: list[dict], keywords: list[dict]) -> list[dict]:
+    """Find campaigns whose ad groups are wholly contained in another campaign.
+
+    Pausing and excluding both work at campaign scope. When one campaign's ad
+    groups also exist in another, a term the parent turned off keeps serving from
+    the shadow. The monitor reports "paused" and nothing actually stopped.
+
+    Measured on a live account (2026-08-12): a campaign holding 28 of 28 ad
+    groups in common with the main one had 11 enabled keywords, all 11 paused in
+    the parent. It ran exactly the terms that had been switched off for low CTR
+    (58 impressions, 1 click). A second such campaign held 189 enabled keywords
+    with 188 paused in the parent; it was paused at campaign level, so nothing
+    showed, but re-enabling it would restore all of them at once.
+
+    The root cause is a mixed taxonomy: splitting by site and splitting by topic
+    sat at the same level, and the topic splits became shadows of the site one.
+
+    Counting at keyword level ("paused somewhere, enabled somewhere") produced
+    379 hits on real data, mostly the same term registered under several ad
+    groups of one campaign — not a missed pause. Nobody reads a 379-item alert.
+    Report the structure instead: three lines on the same data.
+    """
+    names_by_campaign: dict[str, set] = {}
+    for g in ad_groups:
+        names_by_campaign.setdefault(g["campaign_name"], set()).add(g["ad_group_name"])
+
+    enabled_by_campaign: dict[str, set] = {}
+    paused_texts: dict[str, set] = {}
+    for kw in keywords:
+        cn = kw.get("campaign_name") or "?"
+        if kw.get("status") == "ENABLED":
+            enabled_by_campaign.setdefault(cn, set()).add(kw["keyword_text"])
+        elif kw.get("status") == "PAUSED":
+            paused_texts.setdefault(cn, set()).add(kw["keyword_text"])
+
+    alerts = []
+    for child, child_names in names_by_campaign.items():
+        if not child_names:
+            continue
+        for parent, parent_names in names_by_campaign.items():
+            if parent == child or len(parent_names) <= len(child_names):
+                continue
+            shared = child_names & parent_names
+            contained = len(shared) / len(child_names)
+            if contained < SHADOW_CONTAINMENT_RATIO:
+                continue
+            live = enabled_by_campaign.get(child, set())
+            # "Off in the parent" means the parent has it paused and has no
+            # enabled copy left. A term still running in another of the parent's
+            # ad groups was not switched off by the parent.
+            parent_off = paused_texts.get(parent, set()) - enabled_by_campaign.get(parent, set())
+            undone = live & parent_off
+            alerts.append({
+                "level": "CRITICAL" if undone else "WARNING",
+                "category": "shadow_campaign",
+                "message": (
+                    f"Campaign '{child}' shares {contained*100:.0f}% of its ad groups"
+                    f" ({len(shared)}/{len(child_names)}) with '{parent}'."
+                    + (
+                        f" {len(undone)} of its {len(live)} enabled keywords are paused in"
+                        f" '{parent}' — terms you switched off are still serving"
+                        if undone else
+                        " It is not currently running anything the parent switched off,"
+                        " but pausing and excluding are campaign-scoped, so a decision"
+                        " made in one never reaches the other"
+                    )
+                ),
+                "shadow_campaign": child,
+                "parent_campaign": parent,
+                "undone_pause_count": len(undone),
+            })
+            break
+
     return alerts
 
 
@@ -1623,6 +1705,7 @@ CRITICAL_SUBJECT_LABELS: dict[str, str] = {
     "rsa_duplicate": "duplicate ad copy",
     "bq_save_outage": "BigQuery save failing repeatedly",
     "alert_channel_down": "Discord alerts not delivered",
+    "shadow_campaign": "paused terms still serving from another campaign",
 }
 
 
