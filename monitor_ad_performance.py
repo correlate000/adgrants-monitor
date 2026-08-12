@@ -872,6 +872,23 @@ def generate_alerts(
 # How much of a campaign's ad groups must also live elsewhere to call it a shadow
 SHADOW_CONTAINMENT_RATIO = 0.8
 
+# Overlaps you have already decided are intentional, so they stop alerting.
+# Not synced from the private repo: it holds real campaign names.
+SHADOW_CAMPAIGN_ACK_FILE = SCRIPT_DIR / "shadow_campaign_ack.json"
+
+
+def load_shadow_campaign_ack() -> dict[str, str]:
+    """Read the acknowledged overlaps. On any problem, alert on everything."""
+    if not SHADOW_CAMPAIGN_ACK_FILE.exists():
+        return {}
+    try:
+        with open(SHADOW_CAMPAIGN_ACK_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {e["campaign"]: e["parent"] for e in data.get("entries", [])}
+    except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:
+        logger.warning("Could not read the shadow-campaign acknowledgement file: %s", e)
+        return {}
+
 
 def check_shadow_campaigns(ad_groups: list[dict], keywords: list[dict]) -> list[dict]:
     """Find campaigns whose ad groups are wholly contained in another campaign.
@@ -908,6 +925,7 @@ def check_shadow_campaigns(ad_groups: list[dict], keywords: list[dict]) -> list[
         elif kw.get("status") == "PAUSED":
             paused_texts.setdefault(cn, set()).add(kw["keyword_text"])
 
+    acknowledged = load_shadow_campaign_ack()
     alerts = []
     for child, child_names in names_by_campaign.items():
         if not child_names:
@@ -919,30 +937,32 @@ def check_shadow_campaigns(ad_groups: list[dict], keywords: list[dict]) -> list[
             contained = len(shared) / len(child_names)
             if contained < SHADOW_CONTAINMENT_RATIO:
                 continue
+            if acknowledged.get(child) == parent:
+                break   # already decided this one is intentional
             live = enabled_by_campaign.get(child, set())
             # "Off in the parent" means the parent has it paused and has no
             # enabled copy left. A term still running in another of the parent's
             # ad groups was not switched off by the parent.
             parent_off = paused_texts.get(parent, set()) - enabled_by_campaign.get(parent, set())
-            undone = live & parent_off
+            overlap_kw = live & parent_off
             alerts.append({
-                "level": "CRITICAL" if undone else "WARNING",
+                # Structure, not an incident. A theme-split migration produces
+                # exactly this shape on purpose. CRITICAL goes out by email, and
+                # anything that arrives every day in the normal state stops
+                # being read.
+                "level": "WARNING",
                 "category": "shadow_campaign",
                 "message": (
                     f"Campaign '{child}' shares {contained*100:.0f}% of its ad groups"
                     f" ({len(shared)}/{len(child_names)}) with '{parent}'."
-                    + (
-                        f" {len(undone)} of its {len(live)} enabled keywords are paused in"
-                        f" '{parent}' — terms you switched off are still serving"
-                        if undone else
-                        " It is not currently running anything the parent switched off,"
-                        " but pausing and excluding are campaign-scoped, so a decision"
-                        " made in one never reaches the other"
-                    )
+                    f" {len(overlap_kw)} of its {len(live)} enabled keywords are paused in"
+                    f" '{parent}'. Pausing and excluding are campaign-scoped, so a decision"
+                    f" made in one never reaches the other."
+                    f" If this split is intentional, record it in {SHADOW_CAMPAIGN_ACK_FILE.name}"
                 ),
                 "shadow_campaign": child,
                 "parent_campaign": parent,
-                "undone_pause_count": len(undone),
+                "undone_pause_count": len(overlap_kw),
             })
             break
 
