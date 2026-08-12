@@ -70,6 +70,27 @@ SCORE_AUTO_EXECUTE = 7  # >= this -> auto-exclude (with --auto-execute)
 # Impression floor for the high-volume-waste bonus (see score_search_term)
 HIGH_VOLUME_WASTE_MIN_IMP = 100
 
+# Impressions needed before "zero clicks" is evidence of anything.
+#
+# With a 5% baseline CTR, a perfectly ordinary term still shows zero clicks
+# while its impressions are low. The probability is 0.95^impressions:
+#   20 -> 36% | 30 -> 21% | 59 -> 5% | 90 -> 1%
+# So among terms sitting at 20 impressions with no clicks, roughly one in three
+# is fine. Excluding that range cuts off your own subject matter — on a live
+# account the affected terms were the organisation's core topics. Put the line
+# where that probability drops below 5%.
+EVIDENCE_BASELINE_CTR = 0.05
+EVIDENCE_MIN_IMP = 59
+
+
+def evidence_note(impressions: int) -> str:
+    """Say in one line how much weight a zero-click reading carries."""
+    p0 = (1 - EVIDENCE_BASELINE_CTR) ** impressions
+    if impressions >= EVIDENCE_MIN_IMP:
+        return f"safe to exclude (an ordinary term reaches this {p0*100:.0f}% of the time)"
+    return f"not decidable yet ({p0*100:.0f}% of ordinary terms look like this)"
+
+
 # ================================================================
 # Suspicious patterns (EXACT match may misfire but context should be excluded)
 # ================================================================
@@ -322,12 +343,17 @@ def print_report(rows: list[dict], start_date: str, end_date: str) -> None:
         return
 
     print(f"\n[HIGH PRIORITY exclusion candidates (score>={SCORE_HIGH})]: {len(high)} items")
-    print(f"{'Search Term':<35} {'status':<10} {'imp':>6} {'CTR':>7} {'clicks':>7} {'CV':>5} {'score':>6}")
-    print("-" * 80)
+    # Campaign and evidence strength both matter to whoever reviews this list.
+    # The same term can be central to one campaign and peripheral to another,
+    # and a zero-click reading means nothing until enough impressions accrue.
+    print(f"{'Search Term':<30} {'Campaign':<20} {'status':<9} {'imp':>5}"
+          f" {'CTR':>7} {'clicks':>6} {'score':>5}  verdict")
+    print("-" * 110)
     for r in high:
+        verdict = "" if r["clicks"] else evidence_note(r["impressions"])
         print(
-            f"{r['search_term']:<35} {r['status']:<10} {r['impressions']:>6}"
-            f" {r['ctr']*100:>6.1f}% {r['clicks']:>7} {r['conversions']:>5.1f} {r['score']:>6}"
+            f"{r['search_term']:<30} {(r.get('campaign') or '?')[:20]:<20} {r['status']:<9}"
+            f" {r['impressions']:>5} {r['ctr']*100:>6.1f}% {r['clicks']:>6} {r['score']:>5}  {verdict}"
         )
 
     print(f"\n[Exclusion candidates (score {SCORE_CANDIDATE} to {SCORE_HIGH-1})]: {len(candidates) - len(high)} items")
