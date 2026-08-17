@@ -507,9 +507,13 @@ def is_pause_target(kw: dict) -> tuple[bool, str | None]:
     campaign = kw.get("campaign_name", "")
     pause_type = get_campaign_pause_type(campaign)
 
-    # Common: QS=1 stops immediately (cannot participate in auction)
-    if qs is not None and qs <= 1:
-        return True, f"QS {qs} (<=1) / {imp}imp — immediate stop (unrecoverable)"
+    # Common: QS 1 and 2 stop immediately. This is policy, not performance.
+    # "No keywords with a quality score of 1 or 2 permitted"
+    # https://support.google.com/nonprofits/answer/9314402 (verified against the
+    # source text on 2026-08-17). Keywords with no score ("—") are explicitly
+    # exempt from the policy, so they are left alone.
+    if qs is not None and qs <= 2:
+        return True, f"QS {qs} (<=2) / {imp}imp — Ad Grants policy requires pausing"
 
     if pause_type == "cv":
         # CV-focused — stop KWs consuming clicks without CV
@@ -857,8 +861,8 @@ def generate_alerts(
                 "category": "quality_score",
                 "message": (
                     f"Keyword '{kw['keyword_text']}' quality score is"
-                    f" {kw['quality_score']} (< 3). Ad Grants requires QS >= 3."
-                    + ("" if kw['quality_score'] <= 1 else " (Auto-pause is only for QS<=1. Consider improving.)")
+                    f" {kw['quality_score']} (< 3). Ad Grants does not permit keywords"
+                    " with a quality score of 1 or 2, so this is an auto-pause target."
                 ),
                 "keyword_text": kw["keyword_text"],
                 "quality_score": kw["quality_score"],
@@ -1026,6 +1030,59 @@ def identify_pause_targets(
     return targets
 
 
+def is_policy_violation(kw: dict) -> bool:
+    """Whether the keyword is disallowed by Ad Grants policy.
+
+    "No keywords with a quality score of 1 or 2 permitted"
+    https://support.google.com/nonprofits/answer/9314402 (verified 2026-08-17).
+    Keywords with no score ("—") are explicitly exempt, so this returns False.
+    """
+    qs = kw.get("quality_score")
+    return qs is not None and qs <= 2
+
+
+def select_pause_batch(
+    pause_targets: list[dict],
+    today_paused_count: int,
+    strict: bool = False,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split targets into what to pause now and what to defer.
+
+    High-confidence targets are exempt from the caps; the standard quota takes
+    the top-N by impressions. The old design skipped ALL pauses when targets
+    exceeded the per-run cap, so a backlog stalled the pipeline indefinitely.
+
+    Policy violations (QS 1/2) are cap-exempt as well: they are not a performance
+    judgement, and mixing them into the standard quota leaves zero-impression
+    keywords at the tail of the descending sort, so a violation lingers for days
+    (14 such keywords were found still running on 2026-08-17).
+
+    Returns:
+        (pause now, defer to later runs, the subset that was cap-exempt)
+    """
+    high_confidence = [
+        t for t in pause_targets
+        if is_policy_violation(t)
+        or (t["ctr"] < HIGH_CONFIDENCE_CTR_THRESHOLD
+            and t["impressions"] >= HIGH_CONFIDENCE_MIN_IMP)
+    ]
+    high_conf_names = {t["resource_name"] for t in high_confidence}
+    standard = [t for t in pause_targets if t["resource_name"] not in high_conf_names]
+
+    # Remaining standard quota for today (per-day cap applies to standard only)
+    per_day = MAX_PAUSE_PER_DAY_STRICT if strict else MAX_PAUSE_PER_DAY
+    per_run = MAX_PAUSE_PER_RUN_STRICT if strict else MAX_PAUSE_PER_RUN
+    remaining_today = max(0, per_day - today_paused_count)
+    standard_quota = min(per_run, remaining_today)
+    standard_sorted = sorted(standard, key=lambda t: t["impressions"], reverse=True)
+
+    return (
+        high_confidence + standard_sorted[:standard_quota],
+        standard_sorted[standard_quota:],
+        high_confidence,
+    )
+
+
 def pause_keywords(
     client,
     pause_targets: list[dict],
@@ -1083,30 +1140,14 @@ def pause_keywords(
         except Exception as e:
             logger.debug("BQ PAUSE count retrieval failed (falling back to pause_log.json): %s", e)
 
-    # ===== Selection: high-confidence exempt from caps; standard quota takes top-N =====
-    # The old design skipped ALL pauses when targets exceeded the per-run cap, so a
-    # backlog stalled the pipeline indefinitely. Now: process what fits, defer the rest.
-    high_confidence = [
-        t for t in pause_targets
-        if t["ctr"] < HIGH_CONFIDENCE_CTR_THRESHOLD
-        and t["impressions"] >= HIGH_CONFIDENCE_MIN_IMP
-    ]
-    high_conf_names = {t["resource_name"] for t in high_confidence}
-    standard = [t for t in pause_targets if t["resource_name"] not in high_conf_names]
-
-    # Remaining standard quota for today (per-day cap applies to standard only)
-    per_day = MAX_PAUSE_PER_DAY_STRICT if strict else MAX_PAUSE_PER_DAY
-    per_run = MAX_PAUSE_PER_RUN_STRICT if strict else MAX_PAUSE_PER_RUN
-    remaining_today = max(0, per_day - today_paused_count)
-    standard_quota = min(per_run, remaining_today)
-    standard_sorted = sorted(standard, key=lambda t: t["impressions"], reverse=True)
-    selected = high_confidence + standard_sorted[:standard_quota]
-    deferred = standard_sorted[standard_quota:]
+    selected, deferred, high_confidence = select_pause_batch(
+        pause_targets, today_paused_count, strict
+    )
 
     if deferred:
         msg = (
             f"Of {len(pause_targets)} PAUSE targets, processing {len(high_confidence)} "
-            f"high-confidence (cap-exempt) + {min(standard_quota, len(standard_sorted))} "
+            f"high-confidence (cap-exempt) + {len(selected) - len(high_confidence)} "
             f"standard (by imp desc) today; {len(deferred)} carried over to next runs."
         )
         logger.warning(msg)
