@@ -996,8 +996,16 @@ def identify_pause_targets(
     # Keywords inside a paused ad group never serve, so pausing them moves CTR by
     # exactly zero -- yet they still consume the daily pause quota. In a real run on
     # 2026-07-28, 24 of 35 targets were of this kind and crowded out the 11 that mattered.
+    # Ad group names repeat across campaigns (74 duplicated names measured on
+    # 2026-08-12). Matching on the name alone means a single paused ad group
+    # drags every same-named live one down with it. After three topic campaigns
+    # were paused on 2026-08-12 the overlap grew to 22 names, and 774 enabled
+    # keywords fell out of auto-pause entirely (measured 2026-08-19) -- including
+    # two policy violations and two that were well past the performance threshold,
+    # each of which had been reported as a pause target on every single run.
+    # Match on the (campaign, ad group) pair instead.
     paused_ag = {
-        ag["ad_group_name"] for ag in (ad_groups or [])
+        (ag.get("campaign_name"), ag["ad_group_name"]) for ag in (ad_groups or [])
         if ag.get("status") != "ENABLED"
     }
 
@@ -1005,7 +1013,7 @@ def identify_pause_targets(
     for kw in keywords:
         if kw["status"] == "PAUSED":
             continue
-        if kw.get("ad_group_name") in paused_ag:
+        if (kw.get("campaign_name"), kw.get("ad_group_name")) in paused_ag:
             continue
 
         kw_text = kw.get("keyword_text", "")
