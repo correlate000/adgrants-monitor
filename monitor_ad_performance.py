@@ -47,9 +47,26 @@ logger = logging.getLogger(__name__)
 
 # Ad Grants CTR thresholds
 CTR_CRITICAL_THRESHOLD = 0.05   # 5% or below -> CRITICAL (risk of suspension)
-CTR_WARNING_THRESHOLD = 0.07    # 7% or below -> WARNING (approaching danger zone)
+CTR_WARNING_THRESHOLD = 0.07    # 7% or below (INFO on the 7-day window; see below)
 CTR_AD_GROUP_MIN = 0.05         # Per ad group: alert if < 5%
 QS_MIN = 3                      # Ad Grants minimum quality score
+
+# Alerts are graded on the MONTHLY total, not the 7-day window (2026-08-29)
+#
+# Ad Grants suspends on the monthly aggregate CTR. The 7-day window is only a
+# leading indicator. But the old code raised a WARNING whenever the 7-day window
+# dipped below 7%, so while long-tail serving is released toward
+# LONGTAIL_TARGET_CTR = 5.3%, **it fired every morning even when nothing was wrong**.
+# Real case: 2026-08-28, 7-day window 5.67% -> "approaching danger zone" WARNING,
+# while the month-to-date total was 6.20% against a 5% bar. An alarm that always
+# rings gets skipped.
+#
+# Fix: grade on the monthly total. Keep the 7-day window visible as INFO.
+#   monthly  < 5.0%  -> CRITICAL (below the bar; 2 months in a row = suspension)
+#   monthly  < 5.5%  -> WARNING  (less than 0.5pt of headroom left)
+#   7-day    < 5.0%  -> WARNING  (month still fine, but this breaks it if it holds)
+#   7-day   5.0-7.0% -> INFO     (normal while long-tail serving is released)
+MONTHLY_PACE_WARNING_THRESHOLD = 0.055  # WARNING when the monthly total drops below this
 
 # Ad-group level auto-pause (added 2026-07-28)
 # Background: a low-CTR ad group used to raise a WARNING only, and was never paused --
@@ -126,7 +143,8 @@ CTR_KW_PAUSE_50IMP = 0.02       # ctr type: auto-pause if 50+ imp and CTR < 2%
 # serving even inside ad groups that were above 5% overall -- 33% of live impressions.
 KW_STRICT_PAUSE_CTR = 0.05      # The requirement itself
 KW_STRICT_PAUSE_MIN_IMP = 30    # Keep the eligibility floor small
-CTR_EARLY_WARNING_THRESHOLD = 0.06  # 6% -> early warning
+# CTR_EARLY_WARNING_THRESHOLD (6%) was removed on 2026-08-29. The early warning now
+# runs on the monthly total (MONTHLY_PACE_WARNING_THRESHOLD) instead of the 7-day window.
 
 # Safety guards
 MAX_PAUSE_PER_RUN = 5           # Standard quota: max pauses per run (excess carries over)
@@ -801,33 +819,36 @@ def generate_alerts(
         })
         return alerts
 
-    # Account-wide CTR check
+    # Account-wide CTR check (7-day window)
+    #
+    # This is a **leading indicator**, not the unit of judgement. Suspension is decided
+    # on the monthly total, so severity is set by the monthly pacing check at the end of
+    # main(). Here we keep only the sub-5% case as a WARNING and leave the rest as INFO,
+    # so it stays visible without ringing. See "Alerts are graded on the MONTHLY total".
+    #
+    # Before 2026-08-29 the `< 7%` case was a WARNING. While long-tail serving is
+    # released it fired every morning even when nothing was wrong, which trained people
+    # to skip it. The old `elif < 6%` branch sat behind `elif < 7%` and was **dead code
+    # that could never be reached**; this rewrite removes it.
     account_ctr = campaign["ctr"]
     if account_ctr < CTR_CRITICAL_THRESHOLD:
         alerts.append({
-            "level": "CRITICAL",
+            "level": "WARNING",
             "category": "account_ctr",
             "message": (
-                f"Account-wide CTR {format_ctr_raw(account_ctr)} is below 5%."
-                " Ad Grants account will be suspended if this continues for 2 consecutive months."
+                f"7-day CTR {format_ctr_raw(account_ctr)} dropped below 5%."
+                " Suspension is decided on the monthly total, so this figure alone does not"
+                " fail the account, but the month breaks if it holds."
+                " Consider pausing low-CTR keywords or improving ad copy."
             ),
         })
     elif account_ctr < CTR_WARNING_THRESHOLD:
         alerts.append({
-            "level": "WARNING",
+            "level": "INFO",
             "category": "account_ctr",
             "message": (
-                f"Account-wide CTR {format_ctr_raw(account_ctr)} is approaching danger zone (< 7%)."
-                " Consider pausing low-CTR keywords or improving ad copy."
-            ),
-        })
-    elif account_ctr < CTR_EARLY_WARNING_THRESHOLD:
-        alerts.append({
-            "level": "WARNING",
-            "category": "account_ctr_early_warning",
-            "message": (
-                f"Account-wide CTR {format_ctr_raw(account_ctr)} is in early warning zone (< 6%)."
-                " Consider pausing low-CTR keywords or improving ad copy."
+                f"7-day CTR {format_ctr_raw(account_ctr)} (the unit of judgement is the monthly total)."
+                " This level is expected while surplus clicks are spent on low-CTR serving."
             ),
         })
 
@@ -1760,8 +1781,7 @@ def send_discord_notification(webhook_url: str, content: str, embeds: list[dict]
 
 # Human-readable heading per category, used in the CRITICAL email subject
 CRITICAL_SUBJECT_LABELS: dict[str, str] = {
-    "account_ctr": "account CTR below the bar",
-    "account_ctr_early_warning": "account CTR close to the bar",
+    "account_ctr": "7-day CTR below 5%",
     "daily_ctr_streak": "daily CTR below the bar repeatedly",
     "monthly_pace": "monthly CTR pacing below the bar",
     "campaign": "campaign anomaly",
@@ -2184,6 +2204,7 @@ def build_json_report(
         "thresholds": {
             "account_ctr_critical": CTR_CRITICAL_THRESHOLD,
             "account_ctr_warning": CTR_WARNING_THRESHOLD,
+            "monthly_pace_warning": MONTHLY_PACE_WARNING_THRESHOLD,
             "ad_group_ctr_min": CTR_AD_GROUP_MIN,
             "kw_pause_at_100imp": CTR_KW_PAUSE_100IMP,
             "kw_pause_at_50imp": CTR_KW_PAUSE_50IMP,
@@ -3279,6 +3300,19 @@ def main():
                         f"Month-to-date CTR ({month_start_str} to {today_str_jst}) is "
                         f"{mtd_ctr * 100:.2f}%, below the 5% monthly requirement. "
                         "Two consecutive months below 5% deactivates an Ad Grants account."
+                    ),
+                })
+            elif mtd_ctr < MONTHLY_PACE_WARNING_THRESHOLD:
+                # Headroom to the bar is under 0.5pt. This is the only CTR alert that
+                # should reach a human (2026-08-29); the 7-day window no longer rings.
+                margin_pt = (mtd_ctr - CTR_CRITICAL_THRESHOLD) * 100
+                alerts.append({
+                    "level": "WARNING",
+                    "category": "monthly_pace",
+                    "message": (
+                        f"Month-to-date CTR ({month_start_str} to {today_str_jst}) is "
+                        f"{mtd_ctr * 100:.2f}%, only {margin_pt:.2f}pt above the 5% bar. "
+                        "Narrow the long-tail release or pause low-CTR keywords."
                     ),
                 })
     except Exception as e:  # noqa: BLE001 — pace watch must not stop the daily run
