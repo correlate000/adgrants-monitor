@@ -772,12 +772,37 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
     """
     Add score>=SCORE_HIGH + status=NONE candidates as negative keywords.
 
+    Zero-click terms are held back until impressions reach EVIDENCE_MIN_IMP
+    (added 2026-09-03). The report already separated "safe to exclude" from
+    "not enough evidence yet" via evidence_note(), but the execute path ignored
+    that verdict and gated on score alone. Measured on 2026-09-03: of 92
+    candidates at score>=5, only 6 were "safe to exclude"; the other 83 were
+    simply short on impressions. Excluding those blocks the organisation's own
+    core topics. That is not hypothetical -- on 2026-08-29 a negative keyword
+    was found blocking a term that ranks at 29.6% CTR in organic search.
+
     Returns the number of keywords added, or ADD_RESULT_UNKNOWN (-1) when the
     partial_failure breakdown could not be parsed. Never guess the count.
     """
-    targets = [r for r in rows if r["is_high_priority"] and r["status"] == "NONE"]
+    high = [r for r in rows if r["is_high_priority"] and r["status"] == "NONE"]
+
+    # One click is a performance signal. Only zero-click terms need the volume bar.
+    targets = [
+        r for r in high
+        if r.get("clicks", 0) > 0 or r.get("impressions", 0) >= EVIDENCE_MIN_IMP
+    ]
+    held = [r for r in high if r not in targets]
+    if held:
+        # Never trim silently -- always say what was held back
+        logger.info(
+            "Held back for fewer than %d impressions: %d terms (zero clicks is still "
+            "within chance at this volume). First 5: %s",
+            EVIDENCE_MIN_IMP, len(held),
+            ", ".join(f"{r['search_term']}({r['impressions']} imp)" for r in held[:5]),
+        )
+
     if not targets:
-        print("\nNo high-priority exclusion candidates (status=NONE). Nothing added.")
+        print("\nNo high-priority candidates with enough evidence (status=NONE). Nothing added.")
         return 0
 
     ga_service = client.get_service("GoogleAdsService")

@@ -73,7 +73,15 @@ MONTHLY_PACE_WARNING_THRESHOLD = 0.055  # WARNING when the monthly total drops b
 # auto-pause covered keywords alone. Worse, e-mail escalation only fires on CRITICAL,
 # so those WARNINGs reached nobody. One ad group sat at 2.15-4.37% CTR for 11 days
 # before degrading to 1.47% and putting the whole account at risk. Close the loop here.
-AG_PAUSE_MIN_IMP = 30           # Minimum impressions to judge (keep this floor small)
+# 2026-09-03: 30 -> 1. Below the floor of 30 sat 115 ad groups under 5% CTR
+# (719 impressions, 6 clicks). They never became candidates, so they never entered
+# the long-tail headroom accounting either. Measured off-ledger spend was 127 clicks
+# against a declared long-tail budget of 35 -- 3.6x. The floor was not only letting
+# offenders slip through, it was making the budget arithmetic wrong.
+# Protection for freshly resumed ad groups moves to AG_RESUME_GRACE_DAYS instead,
+# following the same "protection by value, on a separate axis" idea as the note below.
+AG_PAUSE_MIN_IMP = 1            # One impression is enough to judge; no eligibility floor
+AG_RESUME_GRACE_DAYS = 7        # Freshly resumed / explored ad groups are exempt this long
 AG_PAUSE_MAX_PER_RUN = 10       # Blast-radius cap for unattended runs; rest is deferred
 AG_MIN_ENABLED = 20             # Never pause below this many enabled ad groups
 AG_ALERT_CRITICAL_MIN_IMP = 100  # 5% breach at this volume is CRITICAL (i.e. e-mailed)
@@ -2228,6 +2236,7 @@ def build_json_report(
 
 AG_PAUSE_EXCLUSION_PATH = SCRIPT_DIR / "ag_pause_exclusion.json"
 AG_PAUSE_LOG_PATH = SCRIPT_DIR / "ag_pause_log.json"
+AG_RESUME_LOG_PATH = SCRIPT_DIR / "ag_resume_log.json"
 
 
 def load_ag_pause_exclusion() -> dict[str, str]:
@@ -2241,6 +2250,73 @@ def load_ag_pause_exclusion() -> dict[str, str]:
     except Exception as e:  # noqa: BLE001 -- a broken exclusion list must not stop monitoring
         logger.warning("Failed to load ad group exclusion list: %s", e)
         return {}
+
+
+def record_ad_group_resumes(targets: list[dict]) -> None:
+    """Record which ad groups were resumed, and when (added 2026-09-03).
+
+    ag_pause_log.json drops the row on resume, so there was nowhere to read
+    "when did this go back on air" from. AG_RESUME_GRACE_DAYS reads this file.
+    """
+    if not targets:
+        return
+    now = datetime.now(tz=JST).isoformat()
+    try:
+        entries = []
+        if AG_RESUME_LOG_PATH.exists():
+            with open(AG_RESUME_LOG_PATH, encoding="utf-8") as f:
+                entries = json.load(f).get("entries", [])
+        incoming = {ag["resource_name"] for ag in targets}
+        entries = [e for e in entries if e.get("resource_name") not in incoming]
+        for ag in targets:
+            entries.append({
+                "resumed_at": now,
+                "resource_name": ag["resource_name"],
+                "ad_group_name": ag.get("ad_group_name", ""),
+                "campaign_name": ag.get("campaign_name", ""),
+                "explore": bool(ag.get("explore")),
+            })
+        # Drop rows older than four times the grace window so this file cannot grow forever
+        cutoff = datetime.now(tz=JST) - timedelta(days=AG_RESUME_GRACE_DAYS * 4)
+        entries = [e for e in entries if _parse_iso(e.get("resumed_at")) >= cutoff]
+        with open(AG_RESUME_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+    except Exception as e:  # noqa: BLE001 -- a bookkeeping failure must not undo the resume
+        logger.warning("Failed to update ad group resume log: %s", e)
+
+
+def _parse_iso(value: str | None) -> datetime:
+    """Parse an ISO string into a tz-aware datetime; unreadable means "oldest" (grace over)."""
+    if not value:
+        return datetime.min.replace(tzinfo=JST)
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.min.replace(tzinfo=JST)
+    return dt if dt.tzinfo else dt.replace(tzinfo=JST)
+
+
+def load_ag_resume_grace() -> dict[str, str]:
+    """Ad groups resumed within the grace window ({resource_name: resumed_at}).
+
+    Right after a resume there are only a handful of impressions, so a 0% CTR says
+    nothing about performance. This is the protection that replaces the eligibility
+    floor removed from AG_PAUSE_MIN_IMP.
+    """
+    if not AG_RESUME_LOG_PATH.exists():
+        return {}
+    try:
+        with open(AG_RESUME_LOG_PATH, encoding="utf-8") as f:
+            entries = json.load(f).get("entries", [])
+    except Exception as e:  # noqa: BLE001 -- a broken log must not stop monitoring
+        logger.warning("Failed to load ad group resume log: %s", e)
+        return {}
+    cutoff = datetime.now(tz=JST) - timedelta(days=AG_RESUME_GRACE_DAYS)
+    return {
+        e["resource_name"]: e.get("resumed_at", "")
+        for e in entries
+        if e.get("resource_name") and _parse_iso(e.get("resumed_at")) >= cutoff
+    }
 
 
 def days_left_in_month(now: datetime | None = None) -> float:
@@ -2303,6 +2379,7 @@ def identify_ad_group_pause_targets(
     means (see the constant for the incident this prevents).
     """
     exclusion = load_ag_pause_exclusion()
+    grace = load_ag_resume_grace()
     enabled = [ag for ag in ad_groups if ag.get("status") == "ENABLED"]
 
     low_ctr = [
@@ -2315,6 +2392,15 @@ def identify_ad_group_pause_targets(
     # Keep what converts. Always say what was spared -- never trim silently.
     candidates = []
     for ag in low_ctr:
+        resumed_at = grace.get(ag.get("resource_name", ""))
+        if resumed_at:
+            logger.info(
+                "Resumed less than %d days ago, not pausing: %s (%s) %d impressions / "
+                "CTR %.2f%% / resumed %s. Too few impressions to judge performance yet",
+                AG_RESUME_GRACE_DAYS, ag["ad_group_name"], ag.get("campaign_name", "--"),
+                ag["impressions"], ag["ctr"] * 100, resumed_at[:16],
+            )
+            continue
         if ag.get("conversions", 0.0) >= AG_PAUSE_CV_PROTECT:
             logger.warning(
                 "Sparing %s (%s): %d impr / %d clicks / %.2f%% CTR / %.1f conversions. "
@@ -2718,6 +2804,8 @@ def resume_ad_groups(client, targets: list[dict], dry_run: bool = False) -> list
     try:
         resp = ag_service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=ops)
         logger.info("Resumed ad groups: %d", len(resp.results))
+        # Start of the grace window. Without this, AG_RESUME_GRACE_DAYS never fires.
+        record_ad_group_resumes(targets)
     except GoogleAdsException as e:
         names = ", ".join(ag["ad_group_name"] for ag in targets[:5])
         logger.error("Failed to resume ad groups: %s", e)
