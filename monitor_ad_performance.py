@@ -2389,6 +2389,22 @@ def identify_ad_group_pause_targets(
         and ag["ad_group_name"] not in exclusion
     ]
 
+    # Report what the exclusion list spared, too (added 2026-09-03).
+    # Until now the exclusion trimmed silently, so the conversion count of an
+    # excluded ad group appeared nowhere -- and the exclusion's own review
+    # condition ("revisit if conversions stay at zero for two weeks") had no
+    # data to be judged on. If we protect something, protect it visibly.
+    for ag in enabled:
+        name = ag["ad_group_name"]
+        if name in exclusion and ag["ctr"] < CTR_AD_GROUP_MIN and ag["impressions"] >= AG_PAUSE_MIN_IMP:
+            logger.info(
+                "On the exclusion list, not pausing: %s (%s) %d impressions / CTR %.2f%% / "
+                "%.1f conversions in window. Reason: %s",
+                name, ag.get("campaign_name", "--"), ag["impressions"],
+                ag["ctr"] * 100, ag.get("conversions", 0.0),
+                (exclusion.get(name) or "")[:60],
+            )
+
     # Keep what converts. Always say what was spared -- never trim silently.
     candidates = []
     for ag in low_ctr:
