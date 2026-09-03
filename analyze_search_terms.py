@@ -27,6 +27,7 @@ import re
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -768,6 +769,59 @@ def _google_ads_failure_type(client):
         return None
 
 
+def _content_dirs() -> list[Path]:
+    """Directories holding the site's article sources (.mdx).
+
+    Set CONTENT_DIRS as a colon-separated list of paths for your own sites.
+    """
+    raw = os.environ.get("CONTENT_DIRS", "")
+    return [Path(p).expanduser() for p in raw.split(":") if p.strip()]
+
+
+@lru_cache(maxsize=1)
+def _content_blob() -> str:
+    """All article bodies as one string, used for the content-domain check.
+
+    A rule saying "do not exclude a query your own articles cover" existed in
+    prose for three and a half months and was never enforced. On 2026-09-03 it
+    was broken by its own author, who added a negative keyword for a term that
+    appears in 34 of the site's articles. Prose rules do not hold; this is the
+    machine version.
+    """
+    parts: list[str] = []
+    dirs = _content_dirs()
+    if not dirs:
+        logger.warning("CONTENT_DIRS is unset -- the content-domain check is disabled")
+        return ""
+    for d in dirs:
+        if not d.exists():
+            logger.warning("Article directory not found: %s (check will be weaker)", d)
+            continue
+        for p in d.rglob("*.mdx"):
+            try:
+                parts.append(p.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 -- one unreadable file must not stop the check
+                continue
+    blob = "\n".join(parts)
+    if not blob:
+        logger.error("Read zero article bodies. The content-domain check is inactive")
+    return blob
+
+
+def is_in_content_domain(search_term: str) -> bool:
+    """Does this search term appear in our own articles?
+
+    Search terms come back tokenised with spaces, so compare with spaces removed.
+    A hit means the term is not out-of-domain: zero clicks point at the ad copy
+    and the landing page, not at the query.
+    """
+    joined = search_term.replace(" ", "").replace("　", "")
+    if len(joined) < 2:
+        return False
+    blob = _content_blob()
+    return bool(blob) and joined in blob
+
+
 def select_negative_keyword_targets(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """Split candidates into "add as negative" and "held back for lack of evidence".
 
@@ -781,12 +835,16 @@ def select_negative_keyword_targets(rows: list[dict]) -> tuple[list[dict], list[
         (to_add, held_back)
     """
     high = [r for r in rows if r["is_high_priority"] and r["status"] == "NONE"]
-    # One click is a performance signal. Only zero-click terms need the volume bar.
-    targets = [
-        r for r in high
-        if r.get("clicks", 0) > 0 or r.get("impressions", 0) >= EVIDENCE_MIN_IMP
-    ]
-    held = [r for r in high if r not in targets]
+    targets, held = [], []
+    for r in high:
+        # One click is a performance signal. Only zero-click terms need the volume bar.
+        if r.get("clicks", 0) <= 0 and r.get("impressions", 0) < EVIDENCE_MIN_IMP:
+            held.append(dict(r, hold_reason=f"fewer than {EVIDENCE_MIN_IMP} impressions"))
+            continue
+        if is_in_content_domain(r["search_term"]):
+            held.append(dict(r, hold_reason="covered by our own articles (fix the ad, not the query)"))
+            continue
+        targets.append(r)
     return targets, held
 
 
