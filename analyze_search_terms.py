@@ -768,6 +768,28 @@ def _google_ads_failure_type(client):
         return None
 
 
+def select_negative_keyword_targets(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split candidates into "add as negative" and "held back for lack of evidence".
+
+    **The selection lives here, in one place.** Until 2026-09-03 the confirmation
+    prompt (in main) and the write path (add_negative_keywords) each wrote the same
+    condition separately. When the evidence bar was added to only one of them, the
+    prompt asked the operator to approve 57 items while the write would have made 2.
+    That breaks what approval means.
+
+    Returns:
+        (to_add, held_back)
+    """
+    high = [r for r in rows if r["is_high_priority"] and r["status"] == "NONE"]
+    # One click is a performance signal. Only zero-click terms need the volume bar.
+    targets = [
+        r for r in high
+        if r.get("clicks", 0) > 0 or r.get("impressions", 0) >= EVIDENCE_MIN_IMP
+    ]
+    held = [r for r in high if r not in targets]
+    return targets, held
+
+
 def add_negative_keywords(client, rows: list[dict]) -> int:
     """
     Add score>=SCORE_HIGH + status=NONE candidates as negative keywords.
@@ -784,14 +806,7 @@ def add_negative_keywords(client, rows: list[dict]) -> int:
     Returns the number of keywords added, or ADD_RESULT_UNKNOWN (-1) when the
     partial_failure breakdown could not be parsed. Never guess the count.
     """
-    high = [r for r in rows if r["is_high_priority"] and r["status"] == "NONE"]
-
-    # One click is a performance signal. Only zero-click terms need the volume bar.
-    targets = [
-        r for r in high
-        if r.get("clicks", 0) > 0 or r.get("impressions", 0) >= EVIDENCE_MIN_IMP
-    ]
-    held = [r for r in high if r not in targets]
+    targets, held = select_negative_keyword_targets(rows)
     if held:
         # Never trim silently -- always say what was held back
         logger.info(
@@ -967,7 +982,11 @@ def run(days: int, save_bq: bool, execute: bool, discord: bool, auto_execute: bo
             logger.error("Discord notification was not sent (not configured, no candidates, or send failure)")
 
     if execute:
-        targets = [r for r in scored_rows if r["is_high_priority"] and r["status"] == "NONE"]
+        # Selection comes from the same function add_negative_keywords uses.
+        # Writing it twice made the prompt say 57 while the write did 2.
+        targets, held_back = select_negative_keyword_targets(scored_rows)
+        if held_back:
+            print(f"\n(Held back for fewer than {EVIDENCE_MIN_IMP} impressions: {len(held_back)})")
         if targets:
             print(f"\nAbout to add the following {len(targets)} items as negative KWs (EXACT match):")
             for r in targets:
