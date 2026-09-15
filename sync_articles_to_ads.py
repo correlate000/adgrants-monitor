@@ -403,6 +403,15 @@ Keyword candidates:"""
 # went straight into the ad and it was disapproved. Removing the symbol outright
 # would turn "80→85万円" into "8085万円" and change the number, so replace with a
 # space instead.
+#
+# Vertical bars (fullwidth ｜ and halfwidth |) added 2026-09-15. Article titles
+# in the "Title｜Subtitle" convention passed through unsanitized and produced a
+# headline the "Punctuation & symbols" policy disapproved. This function is the
+# single entry point every headline path runs through (verbatim, width-cut, or
+# fallback), so adding the character here closes all of them at once. The bar
+# was already in _HEADLINE_TRAILING_BAD below, but that only rstrips a single
+# trailing character — it does not catch a bar embedded mid-string, which is
+# exactly what reached production.
 _AD_TEXT_BANNED = re.compile(
     r"[←-⇿⟰-⟿⤀-⥿]"  # arrows
     r"|[★☆●○◆◇■□▲△▼▽※＊*]"                        # decorative symbols / asterisks
@@ -410,6 +419,7 @@ _AD_TEXT_BANNED = re.compile(
     r"|[…‥]"                                        # ellipses
     r"|[｡-ﾟ]"                              # half-width katakana
     r"|[\U0001F000-\U0001FAFF☀-➿]"        # emoji / dingbats
+    r"|[｜|]"                                        # vertical bars (fullwidth / halfwidth)
 )
 
 
