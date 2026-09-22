@@ -2573,7 +2573,8 @@ def fetch_ad_group_status_by_resource(client, resource_names: list[str]) -> dict
         rn_list = ", ".join(f"'{rn}'" for rn in chunk)
         query = (
             "SELECT ad_group.resource_name, ad_group.name, ad_group.status "
-            f"FROM ad_group WHERE ad_group.resource_name IN ({rn_list})"
+            f"FROM ad_group WHERE ad_group.resource_name IN ({rn_list}) "
+            "AND campaign.status != 'REMOVED'"
         )
         try:
             for row in svc.search(customer_id=CUSTOMER_ID, query=query):
@@ -2818,10 +2819,11 @@ def resume_ad_groups(client, targets: list[dict], dry_run: bool = False) -> list
         ops.append(op)
 
     try:
-        resp = ag_service.mutate_ad_groups(customer_id=CUSTOMER_ID, operations=ops)
-        logger.info("Resumed ad groups: %d", len(resp.results))
-        # Start of the grace window. Without this, AG_RESUME_GRACE_DAYS never fires.
-        record_ad_group_resumes(targets)
+        resp = ag_service.mutate_ad_groups(request={
+            "customer_id": CUSTOMER_ID,
+            "operations": ops,
+            "partial_failure": True,
+        })
     except GoogleAdsException as e:
         names = ", ".join(ag["ad_group_name"] for ag in targets[:5])
         logger.error("Failed to resume ad groups: %s", e)
@@ -2835,18 +2837,53 @@ def resume_ad_groups(client, targets: list[dict], dry_run: bool = False) -> list
         )
         return []
 
+    # partial_failure: a stale target (e.g. under a removed campaign) must not
+    # take the healthy ones down with it (added 2026-09-22, all-or-nothing bug fix)
+    failed_idx: set[int] = set()
+    if resp.partial_failure_error.code != 0:
+        from google.ads.googleads.v23 import errors as ge
+        failed_detail = []
+        for d in resp.partial_failure_error.details:
+            f = ge.GoogleAdsFailure()
+            d.Unpack(f)
+            for err in f.errors:
+                for fr in err.location.field_path_elements:
+                    if fr.field_name == "operations":
+                        failed_idx.add(fr.index)
+                        failed_detail.append(f"{targets[fr.index]['ad_group_name']}: {err.message}")
+        logger.warning(
+            "Ad group resume partially failed: %d / %d. %s",
+            len(failed_idx), len(targets), "; ".join(failed_detail[:5]),
+        )
+        send_alert_email(
+            subject="[AdGrants] ad group resume partially failed",
+            body=(
+                f"{len(failed_idx)} / {len(targets)} ad group(s) could not be resumed.\n"
+                + "\n".join(failed_detail)
+                + "\nCheck the corresponding entries in ag_pause_log.json."
+            ),
+        )
+
+    succeeded = [ag for i, ag in enumerate(targets) if i not in failed_idx]
+    logger.info("Resumed ad groups: %d", len(succeeded))
+    if not succeeded:
+        return []
+
+    # Start of the grace window. Without this, AG_RESUME_GRACE_DAYS never fires.
+    record_ad_group_resumes(succeeded)
+
     # Drop resumed entries from the pause log so they are not picked up again
     try:
         with open(AG_PAUSE_LOG_PATH, encoding="utf-8") as f:
             entries = json.load(f).get("entries", [])
-        resumed_rn = {ag["resource_name"] for ag in targets}
+        resumed_rn = {ag["resource_name"] for ag in succeeded}
         kept_entries = [e for e in entries if e.get("resource_name") not in resumed_rn]
         with open(AG_PAUSE_LOG_PATH, "w", encoding="utf-8") as f:
             json.dump({"entries": kept_entries}, f, ensure_ascii=False, indent=2)
     except Exception as e:  # noqa: BLE001 -- bookkeeping failure does not undo the resume
         logger.warning("Failed to update ad group pause log: %s", e)
 
-    return [dict(ag, dry_run=False) for ag in targets]
+    return [dict(ag, dry_run=False) for ag in succeeded]
 
 
 def load_previous_ad_group_snapshot() -> dict[str, dict]:
